@@ -1,12 +1,14 @@
 //! What an application drives the terminal through.
 
+pub use crate::core::command::ClearMode;
+
 use std::rc::Rc;
 
 use zgui::prelude::{ClipboardKind, GetUntracked, LocalStorage, RwSignal, Set, Signal};
 
 use crate::config::TerminalConfig;
 use crate::core::TerminalCore;
-use crate::core::command::{ClearMode, TerminalCommand};
+use crate::core::command::TerminalCommand;
 use crate::render::CellMetrics;
 use crate::scroll::{ScrollRequest, ScrollState};
 use crate::search::{SearchDirection, SearchOptions, SearchState};

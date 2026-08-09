@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use zgui_terminal::snapshot::RowSnapshot;
 use zgui_terminal::transport::{Channels, TerminalSize};
-use zgui_terminal::{TerminalConfig, testing};
+use zgui_terminal::{ClearMode, TerminalConfig, testing};
 
 /// How long a test waits for the thread that owns the emulator.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -202,6 +202,23 @@ fn a_wide_character_takes_two_columns() {
         .find(|row| row_text(row).contains('世'))
         .expect("the row");
     assert_eq!(row.runs[0].width, 4);
+}
+
+#[test]
+fn clearing_the_screen_takes_what_was_on_it_away() {
+    // The mode is named here, from outside the crate, because that is half of what a clear is: a
+    // mode an application cannot write is a clear it cannot ask for.
+    let harness = Harness::new(20, 5);
+    harness.program_writes(b"hello");
+    harness.wait_for_text("hello");
+
+    harness.core.clear(ClearMode::Screen);
+    // Every row is read out again after a clear, so the row that held the text comes back empty.
+    let rows = harness.rows_until(|rows| rows.iter().any(|row| row.row == 0));
+    assert!(
+        !rows.iter().any(|row| row_text(row).contains("hello")),
+        "the cleared text was still drawn"
+    );
 }
 
 #[test]

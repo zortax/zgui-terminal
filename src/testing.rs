@@ -50,6 +50,11 @@ impl Core {
         self.inner.send(TerminalCommand::Scroll(request));
     }
 
+    /// Empties the screen, the history, or both.
+    pub fn clear(&self, mode: crate::ClearMode) {
+        self.inner.send(TerminalCommand::Clear(mode));
+    }
+
     /// The next rows the emulator published, waiting up to `patience` for them.
     pub fn next_rows(&self, patience: Duration) -> Option<Vec<RowSnapshot>> {
         let deadline = std::time::Instant::now() + patience;
