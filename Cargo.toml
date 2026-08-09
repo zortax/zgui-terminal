@@ -1,0 +1,36 @@
+[package]
+name = "zgui-terminal"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "An embeddable terminal emulator component for Zgui applications"
+repository = "https://github.com/zortax/zgui-terminal"
+keywords = ["terminal", "emulator", "zgui", "vte", "pty"]
+categories = ["gui", "command-line-interface"]
+authors = ["Leonard Seibold <git@zrtx.de>"]
+
+[dependencies]
+zgui = { git = "https://github.com/zortax/zgui" }
+# `LineRequest::families` is `&[Ident]`, and the umbrella crate does not re-export the type.
+zgui-interned = { git = "https://github.com/zortax/zgui" }
+# Reading the colours a style sheet set, which the umbrella crate does not re-export either.
+zgui-css = { git = "https://github.com/zortax/zgui" }
+alacritty_terminal = { version = "0.26", default-features = false }
+flume = { version = "0.12", default-features = false, features = ["async"] }
+parking_lot = "0.12"
+smallvec = "1"
+compact_str = "0.10"
+rustc-hash = "2"
+portable-pty = { version = "0.9", optional = true }
+
+[features]
+default = []
+# A `Transport` that runs a program behind a local pseudo terminal.
+pty = ["dep:portable-pty"]
+
+[dev-dependencies]
+portable-pty = "0.9"
+
+[[example]]
+name = "local_shell"
+required-features = ["pty"]
