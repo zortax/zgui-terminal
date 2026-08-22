@@ -50,6 +50,14 @@ impl Core {
         self.inner.send(TerminalCommand::Scroll(request));
     }
 
+    /// Asks what is under `point`, the way a pointer moving over the grid does.
+    ///
+    /// Takes a raw point rather than a position, because the thing worth testing is what happens
+    /// when one arrives that the grid no longer has a cell for.
+    pub fn hyperlink_at(&self, point: alacritty_terminal::index::Point) {
+        self.inner.send(TerminalCommand::HyperlinkAt(Some(point)));
+    }
+
     /// Empties the screen, the history, or both.
     pub fn clear(&self, mode: crate::ClearMode) {
         self.inner.send(TerminalCommand::Clear(mode));

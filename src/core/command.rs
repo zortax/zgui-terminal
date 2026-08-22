@@ -85,6 +85,11 @@ pub(crate) enum TerminalCommand {
     SetFocus(bool),
     /// Send `bytes` to the program.
     Write(Vec<u8>),
+    /// Publish every row again, whatever was published before.
+    ///
+    /// What a view asks for when it starts drawing a terminal that was already running: it holds
+    /// no rows at all, and what changes from here would leave the screen half empty.
+    Redraw,
     /// Stop the pump.
     Shutdown,
 }

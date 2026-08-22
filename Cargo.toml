@@ -27,6 +27,8 @@ portable-pty = { version = "0.9", optional = true }
 default = []
 # A `Transport` that runs a program behind a local pseudo terminal.
 pty = ["dep:portable-pty"]
+# The seams a test outside this crate needs.
+testing = []
 
 [dev-dependencies]
 portable-pty = "0.9"

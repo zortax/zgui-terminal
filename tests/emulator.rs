@@ -306,3 +306,44 @@ fn leaving_the_screen_a_program_put_in_front_brings_the_history_back() {
     let rows = harness.rows_until(|rows| rows.iter().any(|row| row_text(row).contains("before")));
     assert!(rows.iter().any(|row| row_text(row).contains("before")));
 }
+
+// ---- A pointer over a grid that has just shrunk ---------------------------------------------
+
+/// The point a pointer names is worked out from the view's own layout, which is a frame behind the
+/// grid. Between a shrink and the next layout it names a cell the grid no longer has — and the
+/// thread that answers the question is the thread that reads the program, so a panic there is a
+/// terminal that stops dead and never comes back. It was reachable by dragging a split narrower
+/// with the pointer inside it.
+#[test]
+fn a_point_off_the_end_of_a_shrunken_grid_does_not_stop_the_terminal() {
+    use alacritty_terminal::index::{Column, Line, Point};
+
+    let harness = Harness::new(80, 24);
+    harness.program_writes(b"before\r\n");
+    harness.wait_for_text("before");
+
+    harness.core.resize(TerminalSize {
+        columns: 20,
+        lines: 6,
+        cell_width: 9,
+        cell_height: 19,
+    });
+
+    // Every way a stale point can be out of range: past the last column, past the last line, and
+    // above the top of the history — which arrives as a line that has wrapped around to a huge
+    // number once it is used as an index.
+    for point in [
+        Point::new(Line(0), Column(79)),
+        Point::new(Line(23), Column(0)),
+        Point::new(Line(23), Column(79)),
+        Point::new(Line(-4000), Column(0)),
+        Point::new(Line(i32::MAX), Column(usize::MAX)),
+    ] {
+        harness.core.hyperlink_at(point);
+    }
+
+    // The proof is that the terminal is still reading: a program writing after all that is still
+    // drawn. A pump that panicked would never publish this.
+    harness.program_writes(b"after\r\n");
+    harness.wait_for_text("after");
+}

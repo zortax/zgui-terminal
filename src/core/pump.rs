@@ -327,6 +327,7 @@ impl Pump {
     fn on_command(&mut self, command: TerminalCommand) -> bool {
         match command {
             TerminalCommand::Shutdown => return false,
+            TerminalCommand::Redraw => self.restart_rows(),
             TerminalCommand::Write(bytes) => {
                 self.write(bytes);
             }
@@ -399,6 +400,16 @@ impl Pump {
             TerminalCommand::HyperlinkAt(point) => {
                 let link = point.and_then(|point| {
                     let term = self.term.lock();
+                    // The point was worked out from the view's own layout, which is a frame behind
+                    // the grid. After a shrink it names a cell that is no longer there, and
+                    // indexing one panics *this* thread — which is the thread that reads the
+                    // program, so the terminal stops dead and never comes back.
+                    if point.line < term.topmost_line()
+                        || point.line > term.bottommost_line()
+                        || point.column.0 >= term.columns()
+                    {
+                        return None;
+                    }
                     term.grid()[point].hyperlink().map(|link| Hyperlink {
                         uri: link.uri().to_owned(),
                         id: Some(link.id().to_owned()).filter(|id| !id.is_empty()),

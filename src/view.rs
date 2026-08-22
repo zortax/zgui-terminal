@@ -13,7 +13,6 @@ use zgui::reactive::RenderEffect;
 
 use crate::clipboard::{Clipboard, default_clipboard};
 use crate::config::TerminalConfig;
-use crate::core::TerminalCore;
 use crate::core::command::TerminalCommand;
 use crate::core::update::FrameUpdate;
 use crate::event::{MouseShape, TerminalEvent};
@@ -57,8 +56,15 @@ const BAR_WIDTH: f32 = 8.0;
 #[allow(clippy::too_many_arguments)]
 pub fn Terminal(
     /// What carries bytes to and from the program.
-    #[prop(into)]
+    ///
+    /// The terminal it starts belongs to this view: unmounting stops the program. Hand a
+    /// [`TerminalSession`](crate::TerminalSession) through `session` instead for one that should
+    /// carry on.
+    #[prop(optional, into)]
     transport: TransportSource,
+    /// A terminal that is already running, and that outlives this view.
+    #[prop(optional)]
+    session: Option<crate::TerminalSession>,
     /// The colours, the measurements and the behaviour.
     #[prop(optional, into)]
     config: Option<TerminalConfig>,
@@ -112,17 +118,30 @@ pub fn Terminal(
         cell_width: metrics.width.min(u32::from(u16::MAX)) as u16,
         cell_height: metrics.height.min(u32::from(u16::MAX)) as u16,
     };
-    let core = match TerminalCore::start(
-        transport.take().expect("a transport"),
-        config.clone(),
-        initial,
-    ) {
-        Ok(core) => Rc::new(core),
-        Err(error) => {
-            if let Some(report) = on_event.as_ref() {
-                report(TerminalEvent::Failed(error));
+    // Either the caller's, which outlives this view, or one of this view's own, which does not.
+    // The difference is only who holds a handle: a session with none left stops its program.
+    let (session, borrowed) = match session {
+        Some(session) => (session, true),
+        None => {
+            let started = transport
+                .take()
+                .map(|transport| crate::TerminalSession::start(transport, config.clone(), initial));
+            match started {
+                Some(Ok(session)) => (session, false),
+                Some(Err(error)) => {
+                    if let Some(report) = on_event.as_ref() {
+                        report(TerminalEvent::Failed(error));
+                    }
+                    return AnyView::new(
+                        view! { box(class = "terminal terminal--failed", class = class) },
+                    );
+                }
+                None => {
+                    return AnyView::new(
+                        view! { box(class = "terminal terminal--failed", class = class) },
+                    );
+                }
             }
-            return AnyView::new(view! { box(class = "terminal terminal--failed", class = class) });
         }
     };
 
@@ -141,7 +160,7 @@ pub fn Terminal(
     let restyle = RwSignal::new_local(0u32);
 
     let handle = TerminalHandle {
-        core: Rc::clone(&core),
+        session: session.clone(),
         title,
         dimensions,
         scroll: scroll_state,
@@ -297,7 +316,7 @@ pub fn Terminal(
         }
     };
 
-    let updates = core.updates.clone();
+    let updates = session.watch();
     let pump = spawn_local({
         async move {
             while let Ok(update) = updates.recv_async().await {
@@ -306,12 +325,22 @@ pub fn Terminal(
             }
         }
     });
-    on_cleanup_local(move || drop(pump));
+    on_cleanup_local({
+        // A session the caller owns keeps running: this view only stops drawing it. One this
+        // view started has no handle left anywhere and stops with it.
+        let session = session.clone();
+        move || {
+            drop(pump);
+            if borrowed {
+                session.unwatch();
+            }
+        }
+    });
 
     // The colours everything draws with: the configuration, with whatever a style sheet named
     // over it. What a program sets while it runs is put over both, where the rows are built.
     let colors = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let layout = Rc::clone(&layout);
         let shared = Rc::clone(&shared);
         let grid_handle = grid_handle.clone();
@@ -334,7 +363,7 @@ pub fn Terminal(
             // them is told and every row is read out again.
             let mut with_colors = config.clone();
             with_colors.colors = palette;
-            core.send(TerminalCommand::SetColors(Box::new(with_colors)));
+            session.send(TerminalCommand::SetColors(Box::new(with_colors)));
             grid_handle.relayout();
         })
     };
@@ -342,13 +371,15 @@ pub fn Terminal(
 
     // The size of the grid follows the size of the space it is given.
     //
-    // What re-runs this is deliberate and finite: the window's size and scale, the
-    // configuration, and each published frame. The node's own geometry is read rather than
-    // observed — an observation made inside an effect is made again on every run, and a fresh
-    // one answers nothing, which is an effect that spins forever and learns nothing.
+    // The node's own box is *observed*, and the observation is made here rather than inside the
+    // effect: one made inside is made again on every run, and a fresh one answers nothing, which
+    // is an effect that spins and learns nothing. Made once, it is the only thing that reports a
+    // grid resized by something other than the window — a pane dragged wider, a sidebar opened —
+    // and without it the grid keeps its old size until the program next draws something.
+    let port_box = port.observe_border_box();
     let window = try_use_window();
     let resize = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let layout = Rc::clone(&layout);
         let shared = Rc::clone(&shared);
         let grid_handle = grid_handle.clone();
@@ -361,11 +392,28 @@ pub fn Terminal(
                 let _ = window.scale().get();
             }
             let _ = dimensions.get();
+            // Only while the node is actually there. The observation goes on holding the last box
+            // it saw after the handle has gone, and `scale` answers one for a node that is not
+            // bound — so carrying on here re-measures the face at the wrong scale and lays the
+            // whole grid out again, every frame, for as long as that lasts. Reading the box
+            // straight off the node used to stop this by answering nothing; observing it does not.
+            if port.get_untracked().is_none() {
+                return;
+            }
             let scale = port.scale();
-            let content = port.bounds();
-            let Some(bounds) = content else {
+            // The observation before the one-shot read: the first answers nothing until the node
+            // has been measured, and the box is wanted on that first frame too.
+            let Some(bounds) = port_box.get().or_else(|| port.bounds()) else {
                 return;
             };
+            // A box of no size is not a grid of two columns by one line, which is what the metrics
+            // would round it up to. It is a terminal that is not being laid out — hidden behind
+            // another buffer, or part-way through a resize — and telling the program it is two
+            // columns wide reflows everything it has drawn. It keeps the size it had until there
+            // is a real one to give it.
+            if bounds.size.width.0 <= 0.0 || bounds.size.height.0 <= 0.0 {
+                return;
+            }
 
             let mut metrics = metrics_signal.get_untracked();
             // The face is measured again when the scale changes, because every length here is a
@@ -420,7 +468,7 @@ pub fn Terminal(
             };
             if size != size_signal.get_untracked() {
                 size_signal.set(size);
-                core.send(TerminalCommand::Resize(size));
+                session.send(TerminalCommand::Resize(size));
             }
         })
     };
@@ -428,7 +476,7 @@ pub fn Terminal(
 
     // What a person does with the keyboard.
     let key_down = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let bindings = bindings.clone();
         let config = config.clone();
         let clipboard = Rc::clone(&clipboard);
@@ -450,17 +498,17 @@ pub fn Terminal(
                 };
                 match key {
                     "c" => {
-                        core.send(TerminalCommand::CopySelection(ClipboardKind::Standard));
+                        session.send(TerminalCommand::CopySelection(ClipboardKind::Standard));
                         cx.stop_propagation();
                         return;
                     }
                     "v" => {
-                        let core = Rc::clone(&core);
+                        let session = session.clone();
                         clipboard.read_text(
                             ClipboardKind::Standard,
                             Box::new(move |text| {
                                 if let Some(text) = text {
-                                    core.send(TerminalCommand::Paste(text));
+                                    session.send(TerminalCommand::Paste(text));
                                 }
                             }),
                         );
@@ -470,11 +518,11 @@ pub fn Terminal(
                     _ => {}
                 }
             }
-            let mode = *core.term.lock().mode();
+            let mode = session.mode();
             if let Some(bytes) = encode_key(&event, modifiers, KeyState::Down, mode, &bindings) {
-                core.send(TerminalCommand::Write(bytes.to_vec()));
+                session.send(TerminalCommand::Write(bytes.to_vec()));
                 if config.scroll_to_bottom_on_input {
-                    core.send(TerminalCommand::Scroll(ScrollRequest::Bottom));
+                    session.send(TerminalCommand::Scroll(ScrollRequest::Bottom));
                 }
                 cx.stop_propagation();
             }
@@ -482,24 +530,24 @@ pub fn Terminal(
     };
 
     let key_up = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let bindings = bindings.clone();
         move |cx: &mut EventCx<'_, events::KeyUp>| {
-            let mode = *core.term.lock().mode();
+            let mode = session.mode();
             if let Some(bytes) = encode_key(&*cx, cx.modifiers, KeyState::Up, mode, &bindings) {
-                core.send(TerminalCommand::Write(bytes.to_vec()));
+                session.send(TerminalCommand::Write(bytes.to_vec()));
             }
         }
     };
 
     // What a person composed through an input method.
     let ime_commit = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         move |cx: &mut EventCx<'_, events::ImeCommit>| {
             if let zgui::vocab::ImeEvent::Commit(text) = &**cx
                 && !text.is_empty()
             {
-                core.send(TerminalCommand::Write(text.as_bytes().to_vec()));
+                session.send(TerminalCommand::Write(text.as_bytes().to_vec()));
             }
         }
     };
@@ -511,7 +559,7 @@ pub fn Terminal(
     let wheel_remainder = Rc::new(std::cell::Cell::new(0.0f32));
 
     let pointer_down = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let layout = Rc::clone(&layout);
         let clipboard = Rc::clone(&clipboard);
         let clicks = Rc::clone(&clicks);
@@ -530,7 +578,7 @@ pub fn Terminal(
             // The bar showing where the screen sits in the history, when there is one.
             if layout.borrow().has_history() && inside.0 >= bounds.size.width.0 - BAR_WIDTH {
                 let offset = layout.borrow().offset_at(inside.1, bounds.size.height.0);
-                core.send(TerminalCommand::ScrollTo(offset));
+                session.send(TerminalCommand::ScrollTo(offset));
                 dragging_bar.set(true);
                 cx.capture_pointer();
                 cx.request_focus(cx.current);
@@ -540,18 +588,18 @@ pub fn Terminal(
             let Some(point) = grid_point(inside, &layout) else {
                 return;
             };
-            let mode = *core.term.lock().mode();
+            let mode = session.mode();
             let modifiers = cx.modifiers;
 
             if selects_rather_than_reports(modifiers, mode) {
                 // The middle button pastes the primary selection, as X has always had it.
                 if cx.button == Some(PointerButton::Middle) {
-                    let core = Rc::clone(&core);
+                    let session = session.clone();
                     clipboard.read_text(
                         ClipboardKind::Primary,
                         Box::new(move |text| {
                             if let Some(text) = text {
-                                core.send(TerminalCommand::Paste(text));
+                                session.send(TerminalCommand::Paste(text));
                             }
                         }),
                     );
@@ -563,7 +611,7 @@ pub fn Terminal(
                     point.row,
                     std::time::Instant::now(),
                 );
-                core.send(TerminalCommand::SelectionStart {
+                session.send(TerminalCommand::SelectionStart {
                     point: point.grid,
                     side: point.side,
                     kind: selection_type(count, modifiers),
@@ -579,14 +627,14 @@ pub fn Terminal(
                 modifiers,
                 mode,
             ) {
-                core.send(TerminalCommand::Write(bytes.to_vec()));
+                session.send(TerminalCommand::Write(bytes.to_vec()));
             }
             cx.request_focus(cx.current);
         }
     };
 
     let pointer_move = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let layout = Rc::clone(&layout);
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
@@ -602,7 +650,7 @@ pub fn Terminal(
 
             if dragging_bar.get() {
                 let offset = layout.borrow().offset_at(inside.1, bounds.size.height.0);
-                core.send(TerminalCommand::ScrollTo(offset));
+                session.send(TerminalCommand::ScrollTo(offset));
                 return;
             }
 
@@ -610,14 +658,14 @@ pub fn Terminal(
                 return;
             };
             if dragging.get() {
-                core.send(TerminalCommand::SelectionUpdate {
+                session.send(TerminalCommand::SelectionUpdate {
                     point: point.grid,
                     side: point.side,
                 });
                 return;
             }
-            let mode = *core.term.lock().mode();
-            core.send(TerminalCommand::HyperlinkAt(Some(point.grid)));
+            let mode = session.mode();
+            session.send(TerminalCommand::HyperlinkAt(Some(point.grid)));
             if let Some(bytes) = encode_mouse(
                 MouseReport::Motion(cx.button),
                 point.column,
@@ -625,13 +673,13 @@ pub fn Terminal(
                 cx.modifiers,
                 mode,
             ) {
-                core.send(TerminalCommand::Write(bytes.to_vec()));
+                session.send(TerminalCommand::Write(bytes.to_vec()));
             }
         }
     };
 
     let pointer_up = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let layout = Rc::clone(&layout);
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
@@ -658,11 +706,11 @@ pub fn Terminal(
             };
             if was_dragging {
                 if config.copy_on_select {
-                    core.send(TerminalCommand::CopySelection(ClipboardKind::Primary));
+                    session.send(TerminalCommand::CopySelection(ClipboardKind::Primary));
                 }
                 return;
             }
-            let mode = *core.term.lock().mode();
+            let mode = session.mode();
             if let Some(bytes) = encode_mouse(
                 MouseReport::Release(cx.button.unwrap_or_default()),
                 point.column,
@@ -670,13 +718,13 @@ pub fn Terminal(
                 cx.modifiers,
                 mode,
             ) {
-                core.send(TerminalCommand::Write(bytes.to_vec()));
+                session.send(TerminalCommand::Write(bytes.to_vec()));
             }
         }
     };
 
     let wheel = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let layout = Rc::clone(&layout);
         let remainder = Rc::clone(&wheel_remainder);
         let config = config.clone();
@@ -705,11 +753,11 @@ pub fn Terminal(
             if lines == 0 {
                 return;
             }
-            let mode = *core.term.lock().mode();
+            let mode = session.mode();
             // Positive moves the view toward the newest line, which is scrolling down.
             match wheel_action(-lines, cx.modifiers.shift(), mode) {
                 WheelAction::Scroll(lines) => {
-                    core.send(TerminalCommand::Scroll(ScrollRequest::Lines(lines)));
+                    session.send(TerminalCommand::Scroll(ScrollRequest::Lines(lines)));
                 }
                 WheelAction::Report(notches) => {
                     let report = if notches > 0 {
@@ -723,7 +771,7 @@ pub fn Terminal(
                         .unwrap_or((0, 0));
                     for _ in 0..notches.abs() {
                         if let Some(bytes) = encode_mouse(report, column, row, cx.modifiers, mode) {
-                            core.send(TerminalCommand::Write(bytes.to_vec()));
+                            session.send(TerminalCommand::Write(bytes.to_vec()));
                         }
                     }
                 }
@@ -740,7 +788,7 @@ pub fn Terminal(
                     for _ in 0..notches.abs().min(10) {
                         bytes.extend_from_slice(sequence);
                     }
-                    core.send(TerminalCommand::Write(bytes));
+                    session.send(TerminalCommand::Write(bytes));
                 }
             }
             cx.stop_propagation();
@@ -748,22 +796,22 @@ pub fn Terminal(
     };
 
     let focus_in = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let shared = Rc::clone(&shared);
         let grid_handle = grid_handle.clone();
         move |_: &mut EventCx<'_, events::FocusIn>| {
             shared.borrow_mut().focused = true;
-            core.send(TerminalCommand::SetFocus(true));
+            session.send(TerminalCommand::SetFocus(true));
             grid_handle.repaint();
         }
     };
     let focus_out = {
-        let core = Rc::clone(&core);
+        let session = session.clone();
         let shared = Rc::clone(&shared);
         let grid_handle = grid_handle.clone();
         move |_: &mut EventCx<'_, events::FocusOut>| {
             shared.borrow_mut().focused = false;
-            core.send(TerminalCommand::SetFocus(false));
+            session.send(TerminalCommand::SetFocus(false));
             grid_handle.repaint();
         }
     };

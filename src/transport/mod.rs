@@ -211,6 +211,15 @@ impl TransportSource {
     }
 }
 
+/// A source carrying nothing, which is what a terminal drawing a session it was handed has.
+impl Default for TransportSource {
+    fn default() -> Self {
+        Self {
+            transport: Cell::new(None),
+        }
+    }
+}
+
 impl fmt::Debug for TransportSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("TransportSource")

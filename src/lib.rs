@@ -52,6 +52,7 @@ pub mod render;
 pub mod scroll;
 pub mod search;
 pub mod selection;
+mod session;
 pub mod snapshot;
 pub mod testing;
 pub mod transport;
@@ -66,6 +67,7 @@ pub use crate::handle::{ClearMode, TerminalHandle};
 pub use crate::render::CellMetrics;
 pub use crate::scroll::{ScrollRequest, ScrollState};
 pub use crate::search::{SearchDirection, SearchOptions, SearchState, SearchStatus};
+pub use crate::session::TerminalSession;
 pub use crate::snapshot::{GridDimensions, RowSnapshot};
 pub use crate::transport::{
     ExitStatus, OutputSink, TerminalSize, Transport, TransportError, TransportSource,

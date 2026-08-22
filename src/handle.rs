@@ -2,12 +2,9 @@
 
 pub use crate::core::command::ClearMode;
 
-use std::rc::Rc;
-
 use zgui::prelude::{ClipboardKind, GetUntracked, LocalStorage, RwSignal, Set, Signal};
 
 use crate::config::TerminalConfig;
-use crate::core::TerminalCore;
 use crate::core::command::TerminalCommand;
 use crate::render::CellMetrics;
 use crate::scroll::{ScrollRequest, ScrollState};
@@ -21,7 +18,7 @@ use crate::transport::TerminalSize;
 /// message to the thread that owns it, so nothing here waits for a program.
 #[derive(Clone)]
 pub struct TerminalHandle {
-    pub(crate) core: Rc<TerminalCore>,
+    pub(crate) session: crate::TerminalSession,
     pub(crate) title: RwSignal<Option<String>, LocalStorage>,
     pub(crate) dimensions: RwSignal<GridDimensions, LocalStorage>,
     pub(crate) scroll: RwSignal<ScrollState, LocalStorage>,
@@ -34,42 +31,42 @@ pub struct TerminalHandle {
 impl TerminalHandle {
     /// Sends `bytes` to the program.
     pub fn write(&self, bytes: impl Into<Vec<u8>>) {
-        self.core.send(TerminalCommand::Write(bytes.into()));
+        self.session.send(TerminalCommand::Write(bytes.into()));
     }
 
     /// Sends `text` to the program as though it were pasted.
     pub fn paste(&self, text: impl Into<String>) {
-        self.core.send(TerminalCommand::Paste(text.into()));
+        self.session.send(TerminalCommand::Paste(text.into()));
     }
 
     /// Puts the selected text on the clipboard `kind`.
     pub fn copy(&self, kind: ClipboardKind) {
-        self.core.send(TerminalCommand::CopySelection(kind));
+        self.session.send(TerminalCommand::CopySelection(kind));
     }
 
     /// Selects everything the grid holds.
     pub fn select_all(&self) {
-        self.core.send(TerminalCommand::SelectAll);
+        self.session.send(TerminalCommand::SelectAll);
     }
 
     /// Drops the selection.
     pub fn clear_selection(&self) {
-        self.core.send(TerminalCommand::SelectionClear);
+        self.session.send(TerminalCommand::SelectionClear);
     }
 
     /// Moves the view.
     pub fn scroll(&self, request: ScrollRequest) {
-        self.core.send(TerminalCommand::Scroll(request));
+        self.session.send(TerminalCommand::Scroll(request));
     }
 
     /// Empties the screen, the history, or both.
     pub fn clear(&self, mode: ClearMode) {
-        self.core.send(TerminalCommand::Clear(mode));
+        self.session.send(TerminalCommand::Clear(mode));
     }
 
     /// Returns the emulator to the state it started in.
     pub fn reset(&self) {
-        self.core.send(TerminalCommand::Reset);
+        self.session.send(TerminalCommand::Reset);
     }
 
     /// Draws with a new configuration from now on.
@@ -77,7 +74,7 @@ impl TerminalHandle {
     /// The cell is measured again, so a change of size, family or line height reflows the grid
     /// and the program is told the new number of columns and lines.
     pub fn set_config(&self, config: TerminalConfig) {
-        self.core
+        self.session
             .send(TerminalCommand::SetConfig(Box::new(config.clone())));
         self.config.set(config);
     }
@@ -103,28 +100,28 @@ impl TerminalHandle {
 
     /// Asks the program to end.
     pub fn shutdown(&self) {
-        self.core.send(TerminalCommand::Shutdown);
+        self.session.send(TerminalCommand::Shutdown);
     }
 
     /// What the emulator is doing now: which modes a program has turned on.
     pub fn mode(&self) -> alacritty_terminal::term::TermMode {
-        *self.core.term.lock().mode()
+        *self.session.core().term.lock().mode()
     }
 
     /// Starts looking for `pattern`.
     pub fn search(&self, pattern: impl Into<String>, options: SearchOptions) {
-        self.core
+        self.session
             .send(TerminalCommand::Search(pattern.into(), options));
     }
 
     /// Moves to the next match, wrapping at the ends of the history.
     pub fn search_step(&self, direction: SearchDirection) {
-        self.core.send(TerminalCommand::SearchStep(direction));
+        self.session.send(TerminalCommand::SearchStep(direction));
     }
 
     /// Stops searching.
     pub fn search_clear(&self) {
-        self.core.send(TerminalCommand::SearchClear);
+        self.session.send(TerminalCommand::SearchClear);
     }
 
     /// The title the program asked for.
