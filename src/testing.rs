@@ -95,4 +95,65 @@ impl Core {
     pub fn mode(&self) -> alacritty_terminal::term::TermMode {
         *self.inner.term.lock().mode()
     }
+
+    /// Every line the emulator holds, history and screen alike.
+    pub fn contents(&self) -> crate::grid::Contents {
+        crate::grid::read(&self.inner.term.lock())
+    }
+
+    /// Draws `cursor` in place of the program's, or the program's again when given nothing.
+    pub fn set_cursor(&self, cursor: Option<crate::grid::AppCursor>) {
+        self.inner.send(TerminalCommand::SetCursor(cursor));
+    }
+
+    /// Selects `span`, as a drag would have.
+    pub fn select(&self, span: crate::grid::GridSpan) {
+        self.inner.send(TerminalCommand::Select(span));
+    }
+
+    /// Puts `line` on screen, counted from the oldest one the history holds.
+    pub fn reveal(&self, line: usize) {
+        self.inner.send(TerminalCommand::Reveal(line));
+    }
+
+    /// Drops the selection.
+    pub fn clear_selection(&self) {
+        self.inner.send(TerminalCommand::SelectionClear);
+    }
+
+    /// Lights `spans` until told otherwise.
+    pub fn flash(&self, spans: Vec<crate::grid::GridSpan>) {
+        self.inner.send(TerminalCommand::Flash(spans));
+    }
+
+    /// Says whether the terminal has focus.
+    pub fn set_focus(&self, focused: bool) {
+        self.inner.send(TerminalCommand::SetFocus(focused));
+    }
+
+    /// The next overlay the emulator published, waiting up to `patience` for it.
+    pub fn next_overlay(&self, patience: Duration) -> Option<crate::snapshot::OverlaySnapshot> {
+        let deadline = std::time::Instant::now() + patience;
+        while std::time::Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match self.inner.updates.recv_timeout(left) {
+                Ok(FrameUpdate::Overlay(overlay)) => return Some(*overlay),
+                Ok(_) => continue,
+                Err(_) => return None,
+            }
+        }
+        None
+    }
+
+    /// Where the view sits over the history.
+    pub fn scroll_state(&self) -> crate::ScrollState {
+        use alacritty_terminal::grid::Dimensions;
+
+        let term = self.inner.term.lock();
+        crate::ScrollState {
+            display_offset: term.grid().display_offset(),
+            history: term.history_size(),
+            screen_lines: term.screen_lines(),
+        }
+    }
 }

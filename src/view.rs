@@ -16,6 +16,7 @@ use crate::config::TerminalConfig;
 use crate::core::command::TerminalCommand;
 use crate::core::update::FrameUpdate;
 use crate::event::{MouseShape, TerminalEvent};
+use crate::grid::{Input, PointFilter, PointerPhase};
 use crate::handle::TerminalHandle;
 use crate::input::keyboard::{KeyBindings, KeyState, encode_key};
 use crate::input::mouse::{MouseReport, encode as encode_mouse};
@@ -86,6 +87,15 @@ pub fn Terminal(
     /// A key before the terminal encodes it. Answer `true` to keep it from the program.
     #[prop(optional)]
     on_key: Option<KeyFilter>,
+    /// Whether what a person types reaches the program.
+    ///
+    /// [`Input::Held`] is for an application answering the keyboard itself. Scrolling and
+    /// selecting with the pointer carry on either way.
+    #[prop(into, default = Signal::stored_local(Input::Live))]
+    input: Signal<Input, LocalStorage>,
+    /// A pointer before the terminal acts on it. Answer `true` to keep it from the terminal.
+    #[prop(optional)]
+    on_point: Option<PointFilter>,
     /// Classes the caller put on the terminal.
     #[prop(into, optional)]
     class: Classes,
@@ -158,6 +168,9 @@ pub fn Terminal(
     let screen_lines = RwSignal::new_local(0usize);
     // Counts the times the cell was measured again, so every row knows to draw itself afresh.
     let restyle = RwSignal::new_local(0u32);
+    // Counts the frames that drew something, so an application reading the lines knows when to
+    // read them again.
+    let revision = RwSignal::new_local(0u64);
 
     let handle = TerminalHandle {
         session: session.clone(),
@@ -168,6 +181,7 @@ pub fn Terminal(
         metrics: metrics_signal,
         size: size_signal,
         config: config_signal,
+        revision,
     };
 
     // One signal per row of the screen. A row keeps its element and its signal for as long as the
@@ -180,7 +194,6 @@ pub fn Terminal(
         palette: config.colors,
         columns: 80,
         builtin_glyphs: config.builtin_glyphs,
-        focused: false,
         blink_visible: true,
         shaping: ShapingCache::new(families.clone(), config.letter_spacing),
         shaper,
@@ -196,6 +209,8 @@ pub fn Terminal(
         thumb: config.colors.ansi[8],
     }));
 
+    // The grid's own element, and what a pointer position is measured against: its box in the
+    // window's space, with every ancestor's origin summed in.
     let port = NodeRef::new();
     // What a style sheet said the colours are. The grid reads it, because that is where the
     // computed style is handed over, and reports it here.
@@ -269,6 +284,7 @@ pub fn Terminal(
                     screen_lines.set(wanted);
                 }
                 let _ = rebuild;
+                revision.set(revision.get_untracked().wrapping_add(1));
                 grid_handle.relayout();
             }
             FrameUpdate::Overlay(snapshot) => overlay.set(*snapshot),
@@ -489,6 +505,11 @@ pub fn Terminal(
                 cx.stop_propagation();
                 return;
             }
+            // The application is reading the keyboard itself, so the program reads none of it.
+            if !input.get_untracked().is_live() {
+                cx.stop_propagation();
+                return;
+            }
             // Copy and paste, on the keys every terminal spares for them. Control and shift
             // together produce nothing a program reads, so nothing is taken from one.
             if modifiers.control() && modifiers.shift() {
@@ -533,6 +554,11 @@ pub fn Terminal(
         let session = session.clone();
         let bindings = bindings.clone();
         move |cx: &mut EventCx<'_, events::KeyUp>| {
+            // A release is held back with its press. Under the kitty protocol a program is told
+            // about both, so letting one through reports a key nobody pressed.
+            if !input.get_untracked().is_live() {
+                return;
+            }
             let mode = session.mode();
             if let Some(bytes) = encode_key(&*cx, cx.modifiers, KeyState::Up, mode, &bindings) {
                 session.send(TerminalCommand::Write(bytes.to_vec()));
@@ -544,6 +570,9 @@ pub fn Terminal(
     let ime_commit = {
         let session = session.clone();
         move |cx: &mut EventCx<'_, events::ImeCommit>| {
+            if !input.get_untracked().is_live() {
+                return;
+            }
             if let zgui::vocab::ImeEvent::Commit(text) = &**cx
                 && !text.is_empty()
             {
@@ -554,6 +583,9 @@ pub fn Terminal(
 
     // What a person does with the pointer.
     let clicks = Rc::new(RefCell::new(ClickCounter::new()));
+    let on_point = on_point.map(Rc::new);
+    // Whether the application took the gesture with its pointer filter.
+    let pointing = Rc::new(std::cell::Cell::new(false));
     let dragging = Rc::new(std::cell::Cell::new(false));
     let dragging_bar = Rc::new(std::cell::Cell::new(false));
     let wheel_remainder = Rc::new(std::cell::Cell::new(0.0f32));
@@ -565,8 +597,10 @@ pub fn Terminal(
         let clicks = Rc::clone(&clicks);
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
+        let pointing = Rc::clone(&pointing);
+        let on_point = on_point.clone();
         move |cx: &mut EventCx<'_, events::PointerDown>| {
-            let Some(bounds) = cx.bounds().or_else(|| port.bounds()) else {
+            let Some(bounds) = port.window_bounds() else {
                 return;
             };
             let scale = port.scale();
@@ -588,6 +622,16 @@ pub fn Terminal(
             let Some(point) = grid_point(inside, &layout) else {
                 return;
             };
+            // The application owns the gesture when it says so. The pointer is captured for it,
+            // so a drag that leaves the terminal is still reported here.
+            if let Some(filter) = on_point.as_ref()
+                && filter(point.point(&layout), PointerPhase::Down)
+            {
+                pointing.set(true);
+                cx.capture_pointer();
+                cx.request_focus(cx.current);
+                return;
+            }
             let mode = session.mode();
             let modifiers = cx.modifiers;
 
@@ -620,13 +664,15 @@ pub fn Terminal(
                 // The pointer belongs to the terminal until it comes up, so a selection dragged
                 // past the edge of the window keeps being reported here.
                 cx.capture_pointer();
-            } else if let Some(bytes) = encode_mouse(
-                MouseReport::Press(cx.button.unwrap_or_default()),
-                point.column,
-                point.row,
-                modifiers,
-                mode,
-            ) {
+            } else if input.get_untracked().is_live()
+                && let Some(bytes) = encode_mouse(
+                    MouseReport::Press(cx.button.unwrap_or_default()),
+                    point.column,
+                    point.row,
+                    modifiers,
+                    mode,
+                )
+            {
                 session.send(TerminalCommand::Write(bytes.to_vec()));
             }
             cx.request_focus(cx.current);
@@ -638,8 +684,10 @@ pub fn Terminal(
         let layout = Rc::clone(&layout);
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
+        let pointing = Rc::clone(&pointing);
+        let on_point = on_point.clone();
         move |cx: &mut EventCx<'_, events::PointerMove>| {
-            let Some(bounds) = cx.bounds().or_else(|| port.bounds()) else {
+            let Some(bounds) = port.window_bounds() else {
                 return;
             };
             let scale = port.scale();
@@ -657,6 +705,12 @@ pub fn Terminal(
             let Some(point) = grid_point(inside, &layout) else {
                 return;
             };
+            if pointing.get() {
+                if let Some(filter) = on_point.as_ref() {
+                    filter(point.point(&layout), PointerPhase::Move);
+                }
+                return;
+            }
             if dragging.get() {
                 session.send(TerminalCommand::SelectionUpdate {
                     point: point.grid,
@@ -666,13 +720,15 @@ pub fn Terminal(
             }
             let mode = session.mode();
             session.send(TerminalCommand::HyperlinkAt(Some(point.grid)));
-            if let Some(bytes) = encode_mouse(
-                MouseReport::Motion(cx.button),
-                point.column,
-                point.row,
-                cx.modifiers,
-                mode,
-            ) {
+            if input.get_untracked().is_live()
+                && let Some(bytes) = encode_mouse(
+                    MouseReport::Motion(cx.button),
+                    point.column,
+                    point.row,
+                    cx.modifiers,
+                    mode,
+                )
+            {
                 session.send(TerminalCommand::Write(bytes.to_vec()));
             }
         }
@@ -683,17 +739,20 @@ pub fn Terminal(
         let layout = Rc::clone(&layout);
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
+        let pointing = Rc::clone(&pointing);
+        let on_point = on_point.clone();
         let config = config.clone();
         move |cx: &mut EventCx<'_, events::PointerUp>| {
             let was_dragging = dragging.replace(false);
             let was_bar = dragging_bar.replace(false);
-            if was_dragging || was_bar {
+            let was_pointing = pointing.replace(false);
+            if was_dragging || was_bar || was_pointing {
                 cx.release_pointer();
             }
             if was_bar {
                 return;
             }
-            let Some(bounds) = cx.bounds().or_else(|| port.bounds()) else {
+            let Some(bounds) = port.window_bounds() else {
                 return;
             };
             let scale = port.scale();
@@ -704,6 +763,12 @@ pub fn Terminal(
             let Some(point) = grid_point(inside, &layout) else {
                 return;
             };
+            if was_pointing {
+                if let Some(filter) = on_point.as_ref() {
+                    filter(point.point(&layout), PointerPhase::Up);
+                }
+                return;
+            }
             if was_dragging {
                 if config.copy_on_select {
                     session.send(TerminalCommand::CopySelection(ClipboardKind::Primary));
@@ -711,13 +776,15 @@ pub fn Terminal(
                 return;
             }
             let mode = session.mode();
-            if let Some(bytes) = encode_mouse(
-                MouseReport::Release(cx.button.unwrap_or_default()),
-                point.column,
-                point.row,
-                cx.modifiers,
-                mode,
-            ) {
+            if input.get_untracked().is_live()
+                && let Some(bytes) = encode_mouse(
+                    MouseReport::Release(cx.button.unwrap_or_default()),
+                    point.column,
+                    point.row,
+                    cx.modifiers,
+                    mode,
+                )
+            {
                 session.send(TerminalCommand::Write(bytes.to_vec()));
             }
         }
@@ -731,7 +798,7 @@ pub fn Terminal(
         move |cx: &mut EventCx<'_, events::Wheel>| {
             // Which cell the pointer is over. A program with more than one pane scrolls the one
             // under the pointer, and it can only know which that is from the report.
-            let at = cx.bounds().or_else(|| port.bounds()).and_then(|bounds| {
+            let at = port.window_bounds().and_then(|bounds| {
                 let scale = port.scale();
                 let inside = (
                     cx.position.x.0 * scale - bounds.origin.x.0,
@@ -753,7 +820,13 @@ pub fn Terminal(
             if lines == 0 {
                 return;
             }
-            let mode = session.mode();
+            // A program that grabbed the wheel reads none of it while the keyboard is held; the
+            // view scrolls instead, which is what a mode reading the history wants.
+            let mode = if input.get_untracked().is_live() {
+                session.mode()
+            } else {
+                alacritty_terminal::term::TermMode::empty()
+            };
             // Positive moves the view toward the newest line, which is scrolling down.
             match wheel_action(-lines, cx.modifiers.shift(), mode) {
                 WheelAction::Scroll(lines) => {
@@ -795,24 +868,19 @@ pub fn Terminal(
         }
     };
 
+    // Nothing is repainted here. The emulator is told, and what it publishes over the rows says
+    // whether the terminal has focus — so the rows that draw a cursor draw it again, and the rest
+    // do nothing at all.
     let focus_in = {
         let session = session.clone();
-        let shared = Rc::clone(&shared);
-        let grid_handle = grid_handle.clone();
         move |_: &mut EventCx<'_, events::FocusIn>| {
-            shared.borrow_mut().focused = true;
             session.send(TerminalCommand::SetFocus(true));
-            grid_handle.repaint();
         }
     };
     let focus_out = {
         let session = session.clone();
-        let shared = Rc::clone(&shared);
-        let grid_handle = grid_handle.clone();
         move |_: &mut EventCx<'_, events::FocusOut>| {
-            shared.borrow_mut().focused = false;
             session.send(TerminalCommand::SetFocus(false));
-            grid_handle.repaint();
         }
     };
 
@@ -894,7 +962,7 @@ pub fn Terminal(
 }
 
 /// Where a pointer event falls in the grid.
-struct GridPoint {
+struct Hit {
     /// Which column, counting from zero.
     column: usize,
     /// Which row of the screen.
@@ -905,11 +973,22 @@ struct GridPoint {
     grid: alacritty_terminal::index::Point,
 }
 
+impl Hit {
+    /// The same place, counted from the oldest line the history holds.
+    fn point(&self, layout: &Rc<RefCell<GridLayout>>) -> crate::grid::GridPoint {
+        let history = layout.borrow().history as i64;
+        crate::grid::GridPoint {
+            line: (history + i64::from(self.grid.line.0)).max(0) as usize,
+            column: self.column.min(usize::from(u16::MAX)) as u16,
+        }
+    }
+}
+
 /// Where a pointer `inside` the grid, in device pixels from its corner, falls.
 ///
 /// The grid is the screen, so a row of one is a row of the other and nothing has to be mapped
 /// through a scroll position.
-fn grid_point(inside: (f32, f32), layout: &Rc<RefCell<GridLayout>>) -> Option<GridPoint> {
+fn grid_point(inside: (f32, f32), layout: &Rc<RefCell<GridLayout>>) -> Option<Hit> {
     let layout = layout.borrow();
     let metrics = layout.metrics;
     if metrics.width == 0 || metrics.height == 0 || layout.screen_lines == 0 {
@@ -932,7 +1011,7 @@ fn grid_point(inside: (f32, f32), layout: &Rc<RefCell<GridLayout>>) -> Option<Gr
     } else {
         alacritty_terminal::index::Side::Left
     };
-    Some(GridPoint {
+    Some(Hit {
         column,
         row,
         side,

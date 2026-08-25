@@ -90,13 +90,34 @@ impl SearchOverlay {
     }
 }
 
+/// The columns `rows` covers on `row`.
+fn columns_on(
+    rows: &SmallVec<[(u16, RangeInclusive<u16>); 8]>,
+    row: u16,
+) -> Option<RangeInclusive<u16>> {
+    rows.iter()
+        .find(|(at, _)| *at == row)
+        .map(|(_, columns)| columns.clone())
+}
+
 /// Everything drawn over the rows.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct OverlaySnapshot {
     /// Where the cursor is.
     pub cursor: CursorSnapshot,
+    /// Whether the terminal has focus, which decides whether the cursor is filled or outlined.
+    ///
+    /// Drawn over the rows and the same answer for all of them, so it travels with the rest of
+    /// what is drawn over them rather than beside it. A row is repainted when this arrives, which
+    /// is what makes a terminal that is given the keyboard back fill its cursor in at once.
+    pub focused: bool,
     /// The rows the selection covers, and the columns on each.
     pub selection: SmallVec<[(u16, RangeInclusive<u16>); 8]>,
+    /// The rows the application lit, and the columns on each.
+    ///
+    /// A layer of its own rather than a second selection, so that lighting what a command took
+    /// and selecting what a person is choosing never take the same slot from one another.
+    pub flash: SmallVec<[(u16, RangeInclusive<u16>); 8]>,
     /// What the search found.
     pub search: SearchOverlay,
     /// The link the pointer is over.
@@ -108,16 +129,20 @@ pub struct OverlaySnapshot {
 impl OverlaySnapshot {
     /// The columns the selection covers on `row`.
     pub fn selection_on(&self, row: u16) -> Option<RangeInclusive<u16>> {
-        self.selection
-            .iter()
-            .find(|(at, _)| *at == row)
-            .map(|(_, columns)| columns.clone())
+        columns_on(&self.selection, row)
+    }
+
+    /// The columns the application lit on `row`.
+    pub fn flash_on(&self, row: u16) -> Option<RangeInclusive<u16>> {
+        columns_on(&self.flash, row)
     }
 
     /// What is drawn over `row`.
     pub fn for_row(&self, row: u16) -> crate::snapshot::RowOverlay {
         crate::snapshot::RowOverlay {
+            focused: self.focused,
             selection: self.selection_on(row),
+            flash: self.flash_on(row),
             matches: self.search.on_row(row),
             cursor: (self.cursor.row == row && self.cursor.visible).then_some(self.cursor),
             hovered_hyperlink: self.hovered_hyperlink,

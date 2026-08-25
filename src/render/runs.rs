@@ -172,7 +172,17 @@ pub fn pieces(row: &RowSnapshot, overlay: &RowOverlay, context: RowContext<'_>) 
         let column = index as u16;
         let Some(look) = cell else { continue };
 
-        // The selection and the search decide the background; the cursor decides both.
+        // The selection, the light an application put on, and the search decide the background;
+        // the cursor decides both. A light is drawn as a selection is, because what it means is
+        // the same: these cells are the ones a command was about.
+        if let Some(flash) = &overlay.flash
+            && flash.contains(&column)
+        {
+            look.style.background = palette.selection_background;
+            if let Some(foreground) = palette.selection_foreground {
+                look.style.foreground = foreground;
+            }
+        }
         if let Some(selection) = &overlay.selection
             && selection.contains(&column)
         {

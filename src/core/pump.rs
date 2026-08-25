@@ -26,12 +26,49 @@ use crate::core::prefilter::Prefilter;
 use crate::core::update::{ClipboardReply, FrameUpdate};
 use crate::core::writer::WriteRequest;
 use crate::event::{Hyperlink, MouseShape};
+use crate::grid::{AppCursor, GridSpan, SpanKind};
 use crate::scroll::ScrollState;
 use crate::search::{SearchDirection, SearchOptions, SearchOrigin, SearchState, SearchStatus};
 use crate::snapshot::{
     CursorSnapshot, GridDimensions, OverlaySnapshot, RowBuilder, RowSnapshot, SearchOverlay,
 };
 use crate::transport::{ExitStatus, TerminalSize, TransportError, TransportMessage};
+
+/// The rows a region covers, and the columns it covers on each.
+type Rows = SmallVec<[(u16, std::ops::RangeInclusive<u16>); 8]>;
+
+/// Which columns of each screen row `range` covers.
+///
+/// A block keeps its columns on every row. Anything else runs from where it starts to the end of
+/// that row, whole rows after it, and up to where it ends on the last.
+fn rows_of(
+    range: &alacritty_terminal::selection::SelectionRange,
+    term: &Term<EventProxy>,
+    display_offset: usize,
+) -> Rows {
+    let mut rows = SmallVec::new();
+    for row in 0..term.screen_lines() {
+        let line = Line(row as i32 - display_offset as i32);
+        if line < range.start.line || line > range.end.line {
+            continue;
+        }
+        let start = if line == range.start.line || range.is_block {
+            range.start.column.0
+        } else {
+            0
+        };
+        let end = if line == range.end.line || range.is_block {
+            range.end.column.0
+        } else {
+            term.columns().saturating_sub(1)
+        };
+        if start > end {
+            continue;
+        }
+        rows.push((row as u16, start as u16..=end as u16));
+    }
+    rows
+}
 
 /// The hash of a row that has never been published.
 const NOTHING_SENT: u64 = u64::MAX;
@@ -155,6 +192,10 @@ pub(crate) struct Pump {
     rebuild: bool,
     /// The link the pointer is over.
     hovered_link: Option<crate::snapshot::HyperlinkId>,
+    /// The cursor an application draws in place of the program's, when it draws one.
+    app_cursor: Option<AppCursor>,
+    /// What an application has lit, which nothing but the application puts out.
+    app_flash: Vec<GridSpan>,
 }
 
 impl Pump {
@@ -195,6 +236,8 @@ impl Pump {
             dirty: true,
             rebuild: true,
             hovered_link: None,
+            app_cursor: None,
+            app_flash: Vec::new(),
         };
         (pump, term)
     }
@@ -355,6 +398,13 @@ impl Pump {
                 drop(term);
                 self.dirty = true;
             }
+            TerminalCommand::SetCursor(cursor) => {
+                self.app_cursor = cursor;
+                self.dirty = true;
+            }
+            TerminalCommand::Reveal(line) => {
+                self.reveal(line);
+            }
             TerminalCommand::SelectionStart { point, side, kind } => {
                 self.term.lock().selection = Some(Selection::new(kind, point, side));
                 self.dirty = true;
@@ -365,6 +415,13 @@ impl Pump {
                     selection.update(point, side);
                 }
                 drop(term);
+                self.dirty = true;
+            }
+            TerminalCommand::Select(span) => {
+                self.select(span);
+            }
+            TerminalCommand::Flash(spans) => {
+                self.app_flash = spans;
                 self.dirty = true;
             }
             TerminalCommand::SelectionClear => {
@@ -511,6 +568,66 @@ impl Pump {
         self.dirty = true;
     }
 
+    /// Puts `line` on screen, counted from the oldest one the history holds.
+    ///
+    /// A line already on screen moves nothing: what this promises is that the line can be seen,
+    /// and not where on the screen it is.
+    fn reveal(&mut self, line: usize) {
+        let mut term = self.term.lock();
+        let history = term.history_size();
+        let screen_lines = term.screen_lines();
+        let offset = term.grid().display_offset();
+        // The screen shows `history - offset` up to that plus its own height.
+        let top = history.saturating_sub(offset);
+        let wanted = if line < top {
+            history.saturating_sub(line)
+        } else if line >= top + screen_lines {
+            (history + screen_lines).saturating_sub(line + 1)
+        } else {
+            offset
+        };
+        let wanted = wanted.min(history);
+        if wanted != offset {
+            term.scroll_display(Scroll::Delta(wanted as i32 - offset as i32));
+            self.dirty = true;
+        }
+        drop(term);
+    }
+
+    /// Selects `span`, as a drag would have.
+    fn select(&mut self, span: GridSpan) {
+        let mut term = self.term.lock();
+        let selection = self.selection_of(span, &term);
+        term.selection = Some(selection);
+        drop(term);
+        self.dirty = true;
+    }
+
+    /// The selection `span` describes.
+    ///
+    /// What an application means by a region of the grid, said in the emulator's own terms, so
+    /// that a selection and a light are worked out the same way.
+    fn selection_of(&self, span: GridSpan, term: &Term<EventProxy>) -> Selection {
+        let history = term.history_size();
+        let last = term.last_column();
+        let kind = match span.kind {
+            SpanKind::Cells => SelectionType::Simple,
+            SpanKind::Lines => SelectionType::Lines,
+            SpanKind::Block => SelectionType::Block,
+        };
+        let place = |point: crate::grid::GridPoint| {
+            Point::new(
+                crate::grid::to_line(point.line, history),
+                Column(usize::from(point.column).min(last.0)),
+            )
+        };
+        // Both ends are included, so the far end is taken by its right side: a selection of one
+        // cell is one cell, and not none.
+        let mut selection = Selection::new(kind, place(span.from), Side::Left);
+        selection.update(place(span.to), Side::Right);
+        selection
+    }
+
     /// Publishes every row next time, whatever was published before.
     fn restart_rows(&mut self) {
         self.sent.clear();
@@ -629,48 +746,57 @@ impl Pump {
     /// What is drawn over the rows: the state the emulator does not report as damage.
     fn read_overlay(&self, term: &Term<EventProxy>, display_offset: usize) -> OverlaySnapshot {
         let screen_lines = term.screen_lines();
-        let cursor_point = term.grid().cursor.point;
         let style = term.cursor_style();
+        // Where the cursor is, and what it looks like. An application drawing its own says both,
+        // and its cursor never blinks: it moves when a key is pressed and at no other time.
+        let (point, shape, blinking, shown) = match self.app_cursor {
+            Some(cursor) => (
+                Point::new(
+                    crate::grid::to_line(cursor.at.line, term.history_size()),
+                    Column(usize::from(cursor.at.column)),
+                ),
+                cursor.shape,
+                false,
+                true,
+            ),
+            None => (
+                term.grid().cursor.point,
+                style.shape,
+                style.blinking || self.config.cursor.blinking,
+                term.mode().contains(TermMode::SHOW_CURSOR),
+            ),
+        };
         // The cursor is on the screen the emulator writes to, which is this far down the screen
         // the view draws once the history above it is taken into account.
-        let cursor_row = cursor_point.line.0 + display_offset as i32;
+        let cursor_row = point.line.0 + display_offset as i32;
         let cursor = CursorSnapshot {
             row: cursor_row.clamp(0, screen_lines as i32 - 1) as u16,
-            column: cursor_point.column.0 as u16,
-            shape: style.shape,
-            blinking: style.blinking || self.config.cursor.blinking,
-            visible: term.mode().contains(TermMode::SHOW_CURSOR)
-                && cursor_row >= 0
-                && cursor_row < screen_lines as i32,
+            column: point.column.0 as u16,
+            shape,
+            blinking,
+            visible: shown && cursor_row >= 0 && cursor_row < screen_lines as i32,
         };
 
-        let mut selection = SmallVec::new();
-        if let Some(range) = term.selection.as_ref().and_then(|it| it.to_range(term)) {
-            for row in 0..screen_lines {
-                let line = Line(row as i32 - display_offset as i32);
-                if line < range.start.line || line > range.end.line {
-                    continue;
-                }
-                let start = if line == range.start.line || range.is_block {
-                    range.start.column.0
-                } else {
-                    0
-                };
-                let end = if line == range.end.line || range.is_block {
-                    range.end.column.0
-                } else {
-                    term.columns().saturating_sub(1)
-                };
-                if start > end {
-                    continue;
-                }
-                selection.push((row as u16, start as u16..=end as u16));
+        let selection = term
+            .selection
+            .as_ref()
+            .and_then(|it| it.to_range(term))
+            .map(|range| rows_of(&range, term, display_offset))
+            .unwrap_or_default();
+
+        let mut flash: Rows = SmallVec::new();
+        for span in &self.app_flash {
+            let lit = self.selection_of(*span, term);
+            if let Some(range) = lit.to_range(term) {
+                flash.extend(rows_of(&range, term, display_offset));
             }
         }
 
         OverlaySnapshot {
             cursor,
+            focused: self.focused,
             selection,
+            flash,
             search: self.search_overlay(term, display_offset),
             hovered_hyperlink: self.hovered_link,
             preedit: self.overlay.preedit.clone(),

@@ -2,10 +2,15 @@
 
 pub use crate::core::command::ClearMode;
 
-use zgui::prelude::{ClipboardKind, GetUntracked, LocalStorage, RwSignal, Set, Signal};
+use zgui::prelude::{
+    ClipboardKind, GetUntracked, LocalStorage, Modifiers, RwSignal, Set, Signal, WithUntracked,
+};
+use zgui::vocab::KeyEvent;
 
 use crate::config::TerminalConfig;
 use crate::core::command::TerminalCommand;
+use crate::grid::{AppCursor, Contents, GridSpan};
+use crate::input::keyboard::{KeyBindings, KeyState, encode_key};
 use crate::render::CellMetrics;
 use crate::scroll::{ScrollRequest, ScrollState};
 use crate::search::{SearchDirection, SearchOptions, SearchState};
@@ -26,6 +31,7 @@ pub struct TerminalHandle {
     pub(crate) metrics: RwSignal<CellMetrics, LocalStorage>,
     pub(crate) size: RwSignal<TerminalSize, LocalStorage>,
     pub(crate) config: RwSignal<TerminalConfig, LocalStorage>,
+    pub(crate) revision: RwSignal<u64, LocalStorage>,
 }
 
 impl TerminalHandle {
@@ -42,6 +48,63 @@ impl TerminalHandle {
     /// Puts the selected text on the clipboard `kind`.
     pub fn copy(&self, kind: ClipboardKind) {
         self.session.send(TerminalCommand::CopySelection(kind));
+    }
+
+    /// Sends `event` to the program, encoded as this terminal encodes what is typed.
+    ///
+    /// For an application that held a key back to see what followed it and then decided the
+    /// program should have had it after all. A key that encodes to nothing is dropped, the way a
+    /// bare modifier is.
+    pub fn send_key(&self, event: &KeyEvent, modifiers: Modifiers) {
+        let (alt_sends_escape, to_bottom) = self
+            .config
+            .with_untracked(|config| (config.alt_sends_escape, config.scroll_to_bottom_on_input));
+        let bindings = KeyBindings { alt_sends_escape };
+        let Some(bytes) = encode_key(event, modifiers, KeyState::Down, self.mode(), &bindings)
+        else {
+            return;
+        };
+        self.session.send(TerminalCommand::Write(bytes.to_vec()));
+        if to_bottom {
+            self.session
+                .send(TerminalCommand::Scroll(ScrollRequest::Bottom));
+        }
+    }
+
+    /// Reads every line the terminal holds, history and screen alike.
+    ///
+    /// Answered at once rather than on the next frame, because a caller reading this is deciding
+    /// what a key means. The cost is the size of the history, so a caller that reads on every key
+    /// should keep what it built and read again only when the lines have moved.
+    pub fn contents(&self) -> Contents {
+        crate::grid::read(&self.session.core().term.lock())
+    }
+
+    /// Draws `cursor` in place of the program's, or the program's again when given nothing.
+    ///
+    /// An application's own cursor does not blink and is drawn wherever it is put, including in
+    /// the history. What the program asked for is remembered and comes back untouched.
+    pub fn set_cursor(&self, cursor: Option<AppCursor>) {
+        self.session.send(TerminalCommand::SetCursor(cursor));
+    }
+
+    /// Selects `span`, as a drag would have.
+    pub fn select(&self, span: GridSpan) {
+        self.session.send(TerminalCommand::Select(span));
+    }
+
+    /// Lights `spans` until told otherwise, in the colour a selection is drawn in.
+    ///
+    /// A layer of its own, so lighting what a command took and selecting what a person is
+    /// choosing never take the same slot from one another. Nothing puts the light out on its own:
+    /// an empty list is what does.
+    pub fn flash(&self, spans: Vec<GridSpan>) {
+        self.session.send(TerminalCommand::Flash(spans));
+    }
+
+    /// Puts `line` on screen, counted from the oldest one the history holds.
+    pub fn reveal(&self, line: usize) {
+        self.session.send(TerminalCommand::Reveal(line));
     }
 
     /// Selects everything the grid holds.
@@ -152,5 +215,14 @@ impl TerminalHandle {
     /// How large the grid is in cells and in pixels.
     pub fn size(&self) -> Signal<TerminalSize, LocalStorage> {
         self.size.into()
+    }
+
+    /// A number that changes whenever what [`Self::contents`] would answer might have. Tracked.
+    ///
+    /// What an application reading the lines watches, so it keeps what it built until the grid
+    /// moves. It counts frames that drew something, so it can say a line changed when only the
+    /// cursor did; it never says nothing changed when something has.
+    pub fn revision(&self) -> Signal<u64, LocalStorage> {
+        self.revision.into()
     }
 }

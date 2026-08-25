@@ -173,8 +173,12 @@ impl RowSnapshot {
 /// What is drawn over one row: the parts the emulator does not report as damage.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct RowOverlay {
+    /// Whether the terminal has focus.
+    pub focused: bool,
     /// The columns the selection covers.
     pub selection: Option<RangeInclusive<u16>>,
+    /// The columns the application lit.
+    pub flash: Option<RangeInclusive<u16>>,
     /// The search matches on this row, and which of them is the current one.
     pub matches: SmallVec<[(RangeInclusive<u16>, MatchKind); 4]>,
     /// Where the cursor is on this row, when it is on it.
@@ -187,6 +191,7 @@ impl RowOverlay {
     /// Whether nothing is drawn over the row.
     pub fn is_empty(&self) -> bool {
         self.selection.is_none()
+            && self.flash.is_none()
             && self.matches.is_empty()
             && self.cursor.is_none()
             && self.hovered_hyperlink.is_none()

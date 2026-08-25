@@ -29,8 +29,6 @@ pub struct RowShared {
     pub columns: u16,
     /// Whether box drawing is built rather than shaped.
     pub builtin_glyphs: bool,
-    /// Whether the terminal has focus.
-    pub focused: bool,
     /// Whether a blinking cursor is currently shown.
     pub blink_visible: bool,
     /// What shapes the text, and what it shaped before.
@@ -41,13 +39,16 @@ pub struct RowShared {
 
 impl RowShared {
     /// What a row works its pieces out against.
-    fn context(&self) -> RowContext<'_> {
+    ///
+    /// Whether the terminal has focus comes from the overlay, because that is what the row is
+    /// told when it changes.
+    fn context(&self, focused: bool) -> RowContext<'_> {
         RowContext {
             palette: &self.palette,
             columns: self.columns,
             cell: (self.metrics.width, self.metrics.height),
             builtin_glyphs: self.builtin_glyphs,
-            focused: self.focused,
+            focused,
         }
     }
 }
@@ -107,8 +108,9 @@ impl CustomElement for RowElement {
 
     fn paint(&mut self, painter: &mut ScenePainter<'_>) {
         let mut shared = self.shared.borrow_mut();
-        let pieces = crate::render::runs::pieces(&self.row, &self.overlay, shared.context());
-        paint_row(painter, &mut shared, &pieces);
+        let focused = self.overlay.focused;
+        let pieces = crate::render::runs::pieces(&self.row, &self.overlay, shared.context(focused));
+        paint_row(painter, &mut shared, focused, &pieces);
     }
 }
 
@@ -116,7 +118,12 @@ impl CustomElement for RowElement {
 ///
 /// The order is what a terminal has always used: the colours behind the text, then anything
 /// built from paths, then the text, then the lines under it, and the cursor last.
-fn paint_row(painter: &mut ScenePainter<'_>, shared: &mut RowShared, pieces: &RowPieces) {
+fn paint_row(
+    painter: &mut ScenePainter<'_>,
+    shared: &mut RowShared,
+    focused: bool,
+    pieces: &RowPieces,
+) {
     let metrics = shared.metrics;
     let cell_width = metrics.width as f32;
     let cell_height = metrics.height as f32;
@@ -147,7 +154,7 @@ fn paint_row(painter: &mut ScenePainter<'_>, shared: &mut RowShared, pieces: &Ro
     if let Some(cursor) = pieces.cursor
         && shared.blink_visible
     {
-        paint_cursor(painter, shared, cursor, pieces.cursor_color);
+        paint_cursor(painter, shared, focused, cursor, pieces.cursor_color);
     }
 
     // The characters that have to fill their cell exactly.
@@ -224,9 +231,9 @@ fn paint_row(painter: &mut ScenePainter<'_>, shared: &mut RowShared, pieces: &Ro
     // A cursor that is not a block sits over the character.
     if let Some(cursor) = pieces.cursor
         && shared.blink_visible
-        && !is_block(cursor.shape, shared.focused)
+        && !is_block(cursor.shape, focused)
     {
-        paint_cursor(painter, shared, cursor, pieces.cursor_color);
+        paint_cursor(painter, shared, focused, cursor, pieces.cursor_color);
     }
 }
 
@@ -276,6 +283,7 @@ fn is_block(shape: CursorShape, focused: bool) -> bool {
 fn paint_cursor(
     painter: &mut ScenePainter<'_>,
     shared: &RowShared,
+    focused: bool,
     cursor: crate::snapshot::CursorSnapshot,
     color: Rgba,
 ) {
@@ -293,7 +301,7 @@ fn paint_cursor(
 
     // A terminal without focus draws the cursor as an outline, which is how a person sees at a
     // glance where the keys are going.
-    if !shared.focused {
+    if !focused {
         let thickness = 1.0;
         painter.stroke(
             rect(

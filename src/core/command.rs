@@ -3,6 +3,7 @@
 use alacritty_terminal::index::{Direction, Point, Side};
 use alacritty_terminal::selection::SelectionType;
 
+use crate::grid::{AppCursor, GridSpan};
 use crate::search::{SearchDirection, SearchOptions};
 use crate::transport::TerminalSize;
 
@@ -55,6 +56,10 @@ pub(crate) enum TerminalCommand {
         /// Which half of the cell the pointer is in.
         side: Side,
     },
+    /// Select `span`, as a drag would have.
+    Select(GridSpan),
+    /// Light these spans until told otherwise. Nothing puts the light out.
+    Flash(Vec<GridSpan>),
     /// Drop the selection.
     SelectionClear,
     /// Select everything the grid holds.
@@ -83,6 +88,10 @@ pub(crate) enum TerminalCommand {
     SetColors(Box<crate::config::TerminalConfig>),
     /// Whether the terminal has focus, which the cursor and focus reporting need.
     SetFocus(bool),
+    /// Draw this cursor in place of the program's, or the program's again when there is none.
+    SetCursor(Option<AppCursor>),
+    /// Put this line on screen, counted from the oldest the history holds.
+    Reveal(usize),
     /// Send `bytes` to the program.
     Write(Vec<u8>),
     /// Publish every row again, whatever was published before.

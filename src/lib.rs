@@ -47,6 +47,7 @@ pub mod clipboard;
 pub mod config;
 mod core;
 pub mod event;
+pub mod grid;
 pub mod input;
 pub mod render;
 pub mod scroll;
@@ -63,6 +64,9 @@ mod view;
 pub use crate::clipboard::{Clipboard, ClipboardReply, InProcessClipboard};
 pub use crate::config::{ColorPalette, CursorConfig, TerminalConfig};
 pub use crate::event::{Hyperlink, MouseShape, TerminalEvent};
+pub use crate::grid::{
+    AppCursor, Contents, GridPoint, GridSpan, Input, PointFilter, PointerPhase, SpanKind,
+};
 pub use crate::handle::{ClearMode, TerminalHandle};
 pub use crate::render::CellMetrics;
 pub use crate::scroll::{ScrollRequest, ScrollState};
