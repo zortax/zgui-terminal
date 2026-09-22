@@ -80,3 +80,13 @@ pub use crate::view::{KeyFilter, Terminal, TerminalProps};
 
 /// What the emulator is built on, for an application that needs to name its types.
 pub use alacritty_terminal;
+
+/// The channel library a [`Channels`](transport::Channels) transport is built from.
+///
+/// The transport names `flume` types in its own signature, so an application that builds one
+/// needs the same version of the library.
+pub use flume;
+
+/// The command builder a [`Pty`](transport::Pty) runs.
+#[cfg(feature = "pty")]
+pub use portable_pty;
