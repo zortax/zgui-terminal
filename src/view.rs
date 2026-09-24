@@ -363,14 +363,14 @@ pub fn Terminal(
         let layout = Rc::clone(&layout);
         let shared = Rc::clone(&shared);
         let grid_handle = grid_handle.clone();
-        let applied = Rc::new(RefCell::new(config.colors));
+        let applied = Rc::new(RefCell::new((config.colors, config.clone())));
         RenderEffect::new(move |_| {
             let config = config_signal.get();
             let palette = styled_palette.get().unwrap_or(config.colors);
-            if *applied.borrow() == palette {
+            if !colours_stale(&applied.borrow(), palette, &config) {
                 return;
             }
-            *applied.borrow_mut() = palette;
+            *applied.borrow_mut() = (palette, config.clone());
 
             shared.borrow_mut().palette = palette;
             {
@@ -967,6 +967,18 @@ pub fn Terminal(
     })
 }
 
+/// Whether the emulator needs `palette` sent again, given what was `applied` last.
+///
+/// A new configuration carries its own colours to the emulator, so the palette goes over it again
+/// even when the palette itself is the same.
+fn colours_stale(
+    applied: &(crate::config::ColorPalette, TerminalConfig),
+    palette: crate::config::ColorPalette,
+    config: &TerminalConfig,
+) -> bool {
+    applied.0 != palette || applied.1 != *config
+}
+
 /// Where a pointer event falls in the grid.
 struct Hit {
     /// Which column, counting from zero.
@@ -1059,5 +1071,25 @@ fn measure_cell(
             generation,
         ),
         None => fallback,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::colours_stale;
+    use crate::config::TerminalConfig;
+
+    #[test]
+    fn a_new_configuration_sends_the_palette_again() {
+        let config = TerminalConfig::default();
+        let mut styled = config.colors;
+        styled.background = styled.foreground;
+        let applied = (styled, config.clone());
+        assert!(!colours_stale(&applied, styled, &config));
+
+        let mut larger = config.clone();
+        larger.font_size += 1.0;
+        assert!(colours_stale(&applied, styled, &larger));
+        assert!(colours_stale(&applied, config.colors, &config));
     }
 }
