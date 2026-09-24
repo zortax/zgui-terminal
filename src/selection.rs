@@ -74,6 +74,14 @@ pub fn selects_rather_than_reports(
     modifiers.shift() || !mode.intersects(alacritty_terminal::term::TermMode::MOUSE_MODE)
 }
 
+/// Whether a press of `button` starts a selection.
+///
+/// The primary button selects. The secondary button leaves the selection as it is, so a context
+/// menu opened over it can still copy it.
+pub fn button_selects(button: Option<zgui::vocab::PointerButton>) -> bool {
+    matches!(button, None | Some(zgui::vocab::PointerButton::Primary))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +136,13 @@ mod tests {
             Modifiers::NONE,
             TermMode::default()
         ));
+    }
+
+    #[test]
+    fn only_the_primary_button_selects() {
+        use zgui::vocab::PointerButton;
+        assert!(button_selects(None));
+        assert!(button_selects(Some(PointerButton::Primary)));
+        assert!(!button_selects(Some(PointerButton::Secondary)));
     }
 }

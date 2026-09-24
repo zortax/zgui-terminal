@@ -3,7 +3,8 @@
 pub use crate::core::command::ClearMode;
 
 use zgui::prelude::{
-    ClipboardKind, GetUntracked, LocalStorage, Modifiers, RwSignal, Set, Signal, WithUntracked,
+    ClipboardKind, GetUntracked, LocalStorage, Modifiers, RwSignal, Set, Signal, With,
+    WithUntracked,
 };
 use zgui::vocab::KeyEvent;
 
@@ -32,12 +33,26 @@ pub struct TerminalHandle {
     pub(crate) size: RwSignal<TerminalSize, LocalStorage>,
     pub(crate) config: RwSignal<TerminalConfig, LocalStorage>,
     pub(crate) revision: RwSignal<u64, LocalStorage>,
+    pub(crate) port: zgui::prelude::NodeRef,
+    pub(crate) overlay: RwSignal<crate::snapshot::OverlaySnapshot, LocalStorage>,
 }
 
 impl TerminalHandle {
     /// Sends `bytes` to the program.
     pub fn write(&self, bytes: impl Into<Vec<u8>>) {
         self.session.send(TerminalCommand::Write(bytes.into()));
+    }
+
+    /// Gives the terminal the keyboard.
+    ///
+    /// Does nothing while the view is not mounted.
+    pub fn focus(&self) {
+        self.port.focus();
+    }
+
+    /// Whether a selection shows on the screen. Tracked.
+    pub fn has_selection(&self) -> bool {
+        self.overlay.with(|overlay| !overlay.selection.is_empty())
     }
 
     /// Sends `text` to the program as though it were pasted.

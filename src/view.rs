@@ -26,7 +26,7 @@ use crate::render::row::{RowElement, RowShared};
 use crate::render::shaping::ShapingCache;
 use crate::scroll::{ScrollRequest, ScrollState, WheelAction, lines_from_pixels, wheel_action};
 use crate::search::SearchState;
-use crate::selection::{ClickCounter, selection_type, selects_rather_than_reports};
+use crate::selection::{ClickCounter, button_selects, selection_type, selects_rather_than_reports};
 use crate::snapshot::{GridDimensions, OverlaySnapshot, RowSnapshot};
 use crate::transport::{TerminalSize, TransportSource};
 
@@ -172,6 +172,10 @@ pub fn Terminal(
     // read them again.
     let revision = RwSignal::new_local(0u64);
 
+    // The grid's own element, and what a pointer position is measured against: its box in the
+    // window's space, with every ancestor's origin summed in.
+    let port = NodeRef::new();
+
     let handle = TerminalHandle {
         session: session.clone(),
         title,
@@ -182,6 +186,8 @@ pub fn Terminal(
         size: size_signal,
         config: config_signal,
         revision,
+        port,
+        overlay,
     };
 
     // One signal per row of the screen. A row keeps its element and its signal for as long as the
@@ -209,9 +215,6 @@ pub fn Terminal(
         thumb: config.colors.ansi[8],
     }));
 
-    // The grid's own element, and what a pointer position is measured against: its box in the
-    // window's space, with every ancestor's origin summed in.
-    let port = NodeRef::new();
     // What a style sheet said the colours are. The grid reads it, because that is where the
     // computed style is handed over, and reports it here.
     let styled_palette = RwSignal::new_local(None::<crate::config::ColorPalette>);
@@ -503,6 +506,7 @@ pub fn Terminal(
                 && on_key(&event, modifiers)
             {
                 cx.stop_propagation();
+                cx.prevent_default();
                 return;
             }
             // The application is reading the keyboard itself, so the program reads none of it.
@@ -510,34 +514,29 @@ pub fn Terminal(
                 cx.stop_propagation();
                 return;
             }
-            // Copy and paste, on the keys every terminal spares for them. Control and shift
-            // together produce nothing a program reads, so nothing is taken from one.
-            if modifiers.control() && modifiers.shift() {
-                let key = match &event.key_without_modifiers {
-                    zgui::vocab::Key::Character(text) => text.as_str(),
-                    _ => "",
-                };
-                match key {
-                    "c" => {
-                        session.send(TerminalCommand::CopySelection(ClipboardKind::Standard));
-                        cx.stop_propagation();
-                        return;
-                    }
-                    "v" => {
-                        let session = session.clone();
-                        clipboard.read_text(
-                            ClipboardKind::Standard,
-                            Box::new(move |text| {
-                                if let Some(text) = text {
-                                    session.send(TerminalCommand::Paste(text));
-                                }
-                            }),
-                        );
-                        cx.stop_propagation();
-                        return;
-                    }
-                    _ => {}
+            // Copy and paste, on the keys every terminal spares for them.
+            match crate::input::clipboard_chord(&event, modifiers) {
+                Some(crate::input::ClipboardChord::Copy) => {
+                    session.send(TerminalCommand::CopySelection(ClipboardKind::Standard));
+                    cx.stop_propagation();
+                    cx.prevent_default();
+                    return;
                 }
+                Some(crate::input::ClipboardChord::Paste) => {
+                    let session = session.clone();
+                    clipboard.read_text(
+                        ClipboardKind::Standard,
+                        Box::new(move |text| {
+                            if let Some(text) = text {
+                                session.send(TerminalCommand::Paste(text));
+                            }
+                        }),
+                    );
+                    cx.stop_propagation();
+                    cx.prevent_default();
+                    return;
+                }
+                None => {}
             }
             let mode = session.mode();
             if let Some(bytes) = encode_key(&event, modifiers, KeyState::Down, mode, &bindings) {
@@ -545,7 +544,10 @@ pub fn Terminal(
                 if config.scroll_to_bottom_on_input {
                     session.send(TerminalCommand::Scroll(ScrollRequest::Bottom));
                 }
+                // A key the program reads is the program's alone: tab moves no focus and enter
+                // activates nothing.
                 cx.stop_propagation();
+                cx.prevent_default();
             }
         }
     };
@@ -647,6 +649,10 @@ pub fn Terminal(
                             }
                         }),
                     );
+                    cx.request_focus(cx.current);
+                    return;
+                }
+                if !button_selects(cx.button) {
                     cx.request_focus(cx.current);
                     return;
                 }
