@@ -114,3 +114,35 @@ fn a_title_is_kept_for_a_terminal_nobody_is_drawing() {
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(session.title().as_deref(), Some("a title"));
 }
+
+#[test]
+fn the_end_of_a_program_is_kept_for_a_view_that_attaches_later() {
+    // A tab that was off screen when its shell ended still shows how it ended.
+    let (to_peer, _from_terminal) = flume::unbounded::<Vec<u8>>();
+    let (to_terminal, from_peer) = flume::unbounded::<Vec<u8>>();
+    let (exit, exited) = flume::unbounded();
+    let session = TerminalSession::start(
+        Box::new(Channels::new(to_peer, from_peer).with_exit(exited)),
+        TerminalConfig::default(),
+        TerminalSize {
+            columns: 80,
+            lines: 24,
+            cell_width: 8,
+            cell_height: 16,
+        },
+    )
+    .expect("the terminal starts");
+    assert_eq!(session.exit_status(), None);
+
+    exit.send(zgui_terminal::transport::ExitStatus::code(3))
+        .expect("it ends");
+    drop(to_terminal);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while session.exit_status().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        session.exit_status(),
+        Some(zgui_terminal::transport::ExitStatus::code(3))
+    );
+}

@@ -30,7 +30,8 @@
 //! grow a queue without bound. The title is the one thing kept, because an application draws a
 //! tab for a terminal it is not showing.
 //!
-//! When a view attaches it asks for a redraw, and the emulator publishes every row again.
+//! When a view attaches it asks for a redraw, and the emulator publishes every row again. The
+//! end of the program is kept too, and a view that attaches after the end hears of it.
 
 use std::sync::{Arc, Mutex};
 
@@ -38,7 +39,7 @@ use crate::config::TerminalConfig;
 use crate::core::TerminalCore;
 use crate::core::command::TerminalCommand;
 use crate::core::update::FrameUpdate;
-use crate::transport::{TerminalSize, Transport, TransportError};
+use crate::transport::{ExitStatus, TerminalSize, Transport, TransportError};
 
 /// A running terminal, held apart from any view.
 ///
@@ -51,13 +52,23 @@ pub struct TerminalSession {
 
 struct Inner {
     core: TerminalCore,
-    /// Where published frames go while a view is drawing this. Nothing while none is.
+    /// Where published frames go while a view is drawing this, and how the program ended.
     ///
     /// Behind a mutex because the thread that drains the emulator is not the interface thread.
-    watcher: Mutex<Option<flume::Sender<FrameUpdate>>>,
+    /// One lock holds both, so a view that attaches at the end hears of the end once.
+    watcher: Mutex<Watch>,
     /// The last title the program asked for, so an application can label a terminal it is not
     /// drawing.
     title: Mutex<Option<String>>,
+}
+
+/// The view a session publishes to, and the end it keeps.
+#[derive(Default)]
+struct Watch {
+    /// Where published frames go. Nothing while no view draws the session.
+    sender: Option<flume::Sender<FrameUpdate>>,
+    /// How the program ended, once it has.
+    exited: Option<ExitStatus>,
 }
 
 impl TerminalSession {
@@ -76,7 +87,7 @@ impl TerminalSession {
         let session = Self {
             inner: Arc::new(Inner {
                 core,
-                watcher: Mutex::new(None),
+                watcher: Mutex::new(Watch::default()),
                 title: Mutex::new(None),
             }),
         };
@@ -97,18 +108,17 @@ impl TerminalSession {
                     {
                         held.clone_from(title);
                     }
-                    let watching = inner
-                        .watcher
-                        .lock()
-                        .ok()
-                        .and_then(|watcher| watcher.clone());
-                    if let Some(watcher) = watching
-                        && watcher.send(update).is_err()
+                    let Ok(mut watch) = inner.watcher.lock() else {
+                        return;
+                    };
+                    if let FrameUpdate::Exited(status) = &update {
+                        watch.exited = Some(*status);
+                    }
+                    if let Some(sender) = watch.sender.as_ref()
+                        && sender.send(update).is_err()
                     {
                         // The view went away between the look and the send.
-                        if let Ok(mut watcher) = inner.watcher.lock() {
-                            *watcher = None;
-                        }
+                        watch.sender = None;
                     }
                 }
             })
@@ -123,23 +133,37 @@ impl TerminalSession {
         self.inner.title.lock().ok().and_then(|held| held.clone())
     }
 
+    /// How the program ended, once it has.
+    #[must_use]
+    pub fn exit_status(&self) -> Option<ExitStatus> {
+        self.inner
+            .watcher
+            .lock()
+            .ok()
+            .and_then(|watch| watch.exited)
+    }
+
     /// Whether a view is drawing this.
     #[must_use]
     pub fn is_drawn(&self) -> bool {
         self.inner
             .watcher
             .lock()
-            .is_ok_and(|watcher| watcher.is_some())
+            .is_ok_and(|watch| watch.sender.is_some())
     }
 
     /// Says frames go here now, and asks for every row again.
     ///
     /// Answers where they will arrive. A second view attaching replaces the first, because one
-    /// emulator cannot be typed into from two places.
+    /// emulator cannot be typed into from two places. A program that has ended tells the new
+    /// view so at once.
     pub(crate) fn watch(&self) -> flume::Receiver<FrameUpdate> {
         let (sender, receiver) = flume::unbounded();
-        if let Ok(mut watcher) = self.inner.watcher.lock() {
-            *watcher = Some(sender);
+        if let Ok(mut watch) = self.inner.watcher.lock() {
+            if let Some(status) = watch.exited {
+                let _ = sender.send(FrameUpdate::Exited(status));
+            }
+            watch.sender = Some(sender);
         }
         // Everything, and not only what changes from here: a view attaching has no rows at all.
         self.inner.core.send(TerminalCommand::Redraw);
@@ -169,8 +193,8 @@ impl TerminalSession {
 
     /// Says nobody is drawing it any more. The program carries on.
     pub fn unwatch(&self) {
-        if let Ok(mut watcher) = self.inner.watcher.lock() {
-            *watcher = None;
+        if let Ok(mut watch) = self.inner.watcher.lock() {
+            watch.sender = None;
         }
     }
 
