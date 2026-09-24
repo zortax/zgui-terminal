@@ -196,6 +196,8 @@ pub(crate) struct Pump {
     app_cursor: Option<AppCursor>,
     /// What an application has lit, which nothing but the application puts out.
     app_flash: Vec<GridSpan>,
+    /// Whether the program has ended. The grid stays readable after the end.
+    ended: bool,
 }
 
 impl Pump {
@@ -238,11 +240,15 @@ impl Pump {
             hovered_link: None,
             app_cursor: None,
             app_flash: Vec::new(),
+            ended: false,
         };
         (pump, term)
     }
 
-    /// Reads and publishes until the program ends or the view goes away.
+    /// Reads and publishes until the session goes away.
+    ///
+    /// The end of the program stops the reading. The pump carries on after it, so a view can
+    /// still draw, scroll, select and copy what the program left.
     ///
     /// The first message of a batch is applied at once, which is what keeps a keystroke's echo
     /// quick. Everything that arrives inside the window after it joins the same frame, which is
@@ -291,8 +297,8 @@ impl Pump {
             PumpMessage::Term(event) => self.on_term_event(event),
             PumpMessage::Command(command) => self.on_command(command),
             PumpMessage::Exited(status) => {
-                let _ = self.updates.send(FrameUpdate::Exited(status));
-                false
+                self.end(status);
+                true
             }
             PumpMessage::Failed(error) => {
                 let _ = self.updates.send(FrameUpdate::Failed(error));
@@ -352,16 +358,8 @@ impl Pump {
                 self.update_mouse_shape();
             }
             Event::Wakeup => self.dirty = true,
-            Event::Exit => {
-                let _ = self
-                    .updates
-                    .send(FrameUpdate::Exited(ExitStatus::default()));
-                return false;
-            }
-            Event::ChildExit(status) => {
-                let _ = self.updates.send(FrameUpdate::Exited(how_it_ended(status)));
-                return false;
-            }
+            Event::Exit => self.end(ExitStatus::default()),
+            Event::ChildExit(status) => self.end(how_it_ended(status)),
         }
         true
     }
@@ -522,6 +520,14 @@ impl Pump {
             }
         }
         true
+    }
+
+    /// Reports the end of the program once. A later report of the same end is dropped.
+    fn end(&mut self, status: ExitStatus) {
+        if !self.ended {
+            self.ended = true;
+            let _ = self.updates.send(FrameUpdate::Exited(status));
+        }
     }
 
     /// Sends `bytes` to the program.

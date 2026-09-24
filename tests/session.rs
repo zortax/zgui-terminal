@@ -146,3 +146,35 @@ fn the_end_of_a_program_is_kept_for_a_view_that_attaches_later() {
         Some(zgui_terminal::transport::ExitStatus::code(3))
     );
 }
+
+#[test]
+fn what_an_ended_program_wrote_comes_back_to_a_watcher_that_arrives_late() {
+    // A tab whose shell ended while it was off screen still shows the last output.
+    let (to_peer, _from_terminal) = flume::unbounded::<Vec<u8>>();
+    let (to_terminal, from_peer) = flume::unbounded::<Vec<u8>>();
+    let (exit, exited) = flume::unbounded();
+    let session = TerminalSession::start(
+        Box::new(Channels::new(to_peer, from_peer).with_exit(exited)),
+        TerminalConfig::default(),
+        TerminalSize {
+            columns: 80,
+            lines: 24,
+            cell_width: 8,
+            cell_height: 16,
+        },
+    )
+    .expect("the terminal starts");
+    to_terminal
+        .send(b"LAST-WORDS\r\n".to_vec())
+        .expect("it writes");
+    exit.send(zgui_terminal::transport::ExitStatus::code(0))
+        .expect("it ends");
+    drop(to_terminal);
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while session.exit_status().is_none() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let seen = watch(&session);
+    assert!(drawn(&seen).contains("LAST-WORDS"));
+}
