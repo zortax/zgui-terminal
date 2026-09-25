@@ -1,6 +1,0 @@
-# Local development: build against the framework checkout instead of fetching the git
-# dependency. Delete this file (or the entries) to build against the published revisions.
-[patch."https://github.com/zortax/zgui"]
-zgui = { path = "/home/leo/Projects/zgui/crates/zgui" }
-zgui-interned = { path = "/home/leo/Projects/zgui/crates/zgui-interned" }
-zgui-css = { path = "/home/leo/Projects/zgui/crates/zgui-css" }
