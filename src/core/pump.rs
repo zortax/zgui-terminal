@@ -176,6 +176,8 @@ pub(crate) struct Pump {
     published_columns: usize,
     /// What was drawn over the rows last time.
     overlay: OverlaySnapshot,
+    /// Whether the view drawing now has heard of `overlay`. A view that attaches has not.
+    overlay_sent: bool,
     /// The size the program was last told about.
     size: TerminalSize,
     /// The search in progress.
@@ -230,6 +232,7 @@ impl Pump {
             published_offset: 0,
             published_columns: dimensions.columns,
             overlay: OverlaySnapshot::default(),
+            overlay_sent: false,
             size,
             search: None,
             search_state: SearchState::default(),
@@ -639,6 +642,7 @@ impl Pump {
         self.sent.clear();
         self.rebuild = true;
         self.dirty = true;
+        self.overlay_sent = false;
     }
 
     /// What the pointer should look like now.
@@ -743,7 +747,8 @@ impl Pump {
                 rebuild,
             });
         }
-        if overlay != self.overlay {
+        if !self.overlay_sent || overlay != self.overlay {
+            self.overlay_sent = true;
             self.overlay = overlay.clone();
             let _ = self.updates.send(FrameUpdate::Overlay(Box::new(overlay)));
         }

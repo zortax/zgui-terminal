@@ -335,7 +335,7 @@ pub fn Terminal(
         }
     };
 
-    let updates = session.watch();
+    let (attached, updates) = session.watch();
     let pump = spawn_local({
         async move {
             while let Ok(update) = updates.recv_async().await {
@@ -351,7 +351,7 @@ pub fn Terminal(
         move || {
             drop(pump);
             if borrowed {
-                session.unwatch();
+                session.unwatch_view(attached);
             }
         }
     });

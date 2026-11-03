@@ -69,6 +69,9 @@ struct Watch {
     sender: Option<flume::Sender<FrameUpdate>>,
     /// How the program ended, once it has.
     exited: Option<ExitStatus>,
+    /// Counts the views that attached, so a view lets go of the session only while it is still
+    /// the one drawing it.
+    attached: u64,
 }
 
 impl TerminalSession {
@@ -154,20 +157,34 @@ impl TerminalSession {
 
     /// Says frames go here now, and asks for every row again.
     ///
-    /// Answers where they will arrive. A second view attaching replaces the first, because one
-    /// emulator cannot be typed into from two places. A program that has ended tells the new
-    /// view so at once.
-    pub(crate) fn watch(&self) -> flume::Receiver<FrameUpdate> {
+    /// Answers where they will arrive, and the number of this attachment for
+    /// [`Self::unwatch_view`]. A second view attaching replaces the first, because one emulator
+    /// cannot be typed into from two places. A program that has ended tells the new view so at
+    /// once.
+    pub(crate) fn watch(&self) -> (u64, flume::Receiver<FrameUpdate>) {
         let (sender, receiver) = flume::unbounded();
+        let mut attached = 0;
         if let Ok(mut watch) = self.inner.watcher.lock() {
             if let Some(status) = watch.exited {
                 let _ = sender.send(FrameUpdate::Exited(status));
             }
             watch.sender = Some(sender);
+            watch.attached += 1;
+            attached = watch.attached;
         }
         // Everything, and not only what changes from here: a view attaching has no rows at all.
         self.inner.core.send(TerminalCommand::Redraw);
-        receiver
+        (attached, receiver)
+    }
+
+    /// Says the view of attachment `attached` stops drawing. A view that attached since keeps
+    /// the session, so a view that mounts before the one it replaces unmounts keeps drawing.
+    pub(crate) fn unwatch_view(&self, attached: u64) {
+        if let Ok(mut watch) = self.inner.watcher.lock()
+            && watch.attached == attached
+        {
+            watch.sender = None;
+        }
     }
 
     /// Watches, answering only the rows, for a test that has no view.
@@ -177,7 +194,7 @@ impl TerminalSession {
     #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn watch_for_test(&self) -> flume::Receiver<Vec<crate::snapshot::RowSnapshot>> {
-        let frames = self.watch();
+        let (_, frames) = self.watch();
         let (rows, seen) = flume::unbounded();
         std::thread::spawn(move || {
             for update in frames.iter() {
@@ -224,5 +241,39 @@ impl std::fmt::Debug for TerminalSession {
             .debug_struct("TerminalSession")
             .field("drawn", &self.is_drawn())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalSession;
+    use crate::TerminalConfig;
+    use crate::transport::{Channels, TerminalSize};
+
+    fn session() -> TerminalSession {
+        let (to_peer, _from_terminal) = flume::unbounded::<Vec<u8>>();
+        let (_to_terminal, from_peer) = flume::unbounded::<Vec<u8>>();
+        TerminalSession::start(
+            Box::new(Channels::new(to_peer, from_peer)),
+            TerminalConfig::default(),
+            TerminalSize {
+                columns: 80,
+                lines: 24,
+                cell_width: 8,
+                cell_height: 16,
+            },
+        )
+        .expect("the terminal starts")
+    }
+
+    #[test]
+    fn a_view_that_unmounts_after_its_successor_mounted_leaves_the_session_drawn() {
+        let session = session();
+        let (first, _old) = session.watch();
+        let (second, _new) = session.watch();
+        session.unwatch_view(first);
+        assert!(session.is_drawn(), "the newer view keeps drawing");
+        session.unwatch_view(second);
+        assert!(!session.is_drawn());
     }
 }
