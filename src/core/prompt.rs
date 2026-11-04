@@ -9,6 +9,8 @@
 //! resize the rows from there to the bottom stay out of the reflow, the cursor stays the same
 //! number of rows below the prompt start, and the old rows come back unreflowed. The shell then
 //! draws the prompt over them at the new width.
+//!
+//! A view scrolled into the history keeps the line at its top across the resize.
 
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::{Dimensions, Row};
@@ -16,6 +18,7 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 
+use crate::core::anchor::Anchor;
 use crate::core::prefilter::PromptMark;
 
 /// Where the prompt the shell edits now starts.
@@ -54,7 +57,11 @@ impl PromptTracker {
     /// Gives `term` the size `size`, with the prompt kept out of the reflow.
     pub fn resize<T, S: Dimensions>(&mut self, term: &mut Term<T>, size: S) {
         let Some(start) = self.start_on_screen(term) else {
+            let anchor = Anchor::of(term.grid());
             term.resize(size);
+            if let Some(anchor) = anchor {
+                anchor.restore(term.grid_mut());
+            }
             return;
         };
 
@@ -84,6 +91,8 @@ impl PromptTracker {
         grid.cursor.point.column = Column(0);
         grid.cursor.input_needs_wrap = false;
 
+        // Read with the prompt rows blank, which is how the grid reflows them.
+        let anchor = Anchor::of(term.grid());
         term.resize(size);
 
         let grid = term.grid_mut();
@@ -105,6 +114,9 @@ impl PromptTracker {
             }
         }
         grid.cursor.point.column = Column(cursor.column.0.min(columns - 1));
+        if let Some(anchor) = anchor {
+            anchor.restore(grid);
+        }
         self.start = Some(term.history_size() + top);
     }
 }

@@ -1,5 +1,6 @@
 //! What owns the emulator, and the threads that keep it running.
 
+pub(crate) mod anchor;
 pub(crate) mod command;
 pub(crate) mod listener;
 pub(crate) mod prefilter;
