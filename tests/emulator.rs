@@ -136,6 +136,41 @@ fn a_program_asking_where_the_cursor_is_gets_an_answer() {
     assert_eq!(reply, b"\x1b[3;5R");
 }
 
+/// A palette that differs from the default in every colour a query can read.
+fn styled() -> TerminalConfig {
+    let mut config = TerminalConfig::default();
+    config.colors.foreground = zgui_terminal::config::Rgba::rgb(0xe8, 0xe8, 0xd3);
+    config.colors.background = zgui_terminal::config::Rgba::rgb(0x12, 0x12, 0x12);
+    config.colors.cursor = zgui_terminal::config::Rgba::rgb(0xff, 0xa5, 0x60);
+    config.colors.ansi[4] = zgui_terminal::config::Rgba::rgb(0x84, 0x97, 0xbf);
+    config
+}
+
+#[test]
+fn a_program_asking_for_the_colours_hears_the_styled_ones() {
+    let harness = Harness::new(20, 5);
+    harness.core.set_colors(styled());
+    harness.program_writes(b"\x1b]10;?\x07");
+    assert_eq!(harness.terminal_wrote(), b"\x1b]10;rgb:e8e8/e8e8/d3d3\x07");
+    harness.program_writes(b"\x1b]11;?\x1b\\");
+    assert_eq!(
+        harness.terminal_wrote(),
+        b"\x1b]11;rgb:1212/1212/1212\x1b\\"
+    );
+    harness.program_writes(b"\x1b]12;?\x07");
+    assert_eq!(harness.terminal_wrote(), b"\x1b]12;rgb:ffff/a5a5/6060\x07");
+    harness.program_writes(b"\x1b]4;4;?\x07");
+    assert_eq!(harness.terminal_wrote(), b"\x1b]4;4;rgb:8484/9797/bfbf\x07");
+}
+
+#[test]
+fn a_colour_the_program_set_answers_for_itself() {
+    let harness = Harness::new(20, 5);
+    harness.core.set_colors(styled());
+    harness.program_writes(b"\x1b]11;#203040\x07\x1b]11;?\x07");
+    assert_eq!(harness.terminal_wrote(), b"\x1b]11;rgb:2020/3030/4040\x07");
+}
+
 #[test]
 fn colours_reach_the_rows() {
     let harness = Harness::new(20, 5);
@@ -346,4 +381,47 @@ fn a_point_off_the_end_of_a_shrunken_grid_does_not_stop_the_terminal() {
     // drawn. A pump that panicked would never publish this.
     harness.program_writes(b"after\r\n");
     harness.wait_for_text("after");
+}
+
+#[test]
+fn sizes_in_quick_succession_reach_the_program_once_they_rest() {
+    let (to_peer, _from_terminal) = flume::unbounded::<Vec<u8>>();
+    let (_to_terminal, from_peer) = flume::unbounded::<Vec<u8>>();
+    let (resize_tx, resized) = flume::unbounded::<TerminalSize>();
+    let transport = Channels::new(to_peer, from_peer).with_resize(resize_tx);
+    let config = TerminalConfig {
+        coalesce_window: Duration::ZERO,
+        resize_settle: Duration::from_millis(80),
+        ..TerminalConfig::default()
+    };
+    let size = |columns| TerminalSize {
+        columns,
+        lines: 10,
+        cell_width: 9,
+        cell_height: 19,
+    };
+    let core = testing::Core::start(transport, config, size(20)).expect("a terminal");
+
+    // The transport hears the starting size.
+    assert_eq!(resized.recv_timeout(PATIENCE).unwrap().columns, 20);
+    // The first size is the one the view measured, and applies at once.
+    core.resize(size(30));
+    assert_eq!(
+        resized
+            .recv_timeout(Duration::from_millis(40))
+            .unwrap()
+            .columns,
+        30
+    );
+
+    for columns in [40, 50, 60, 70] {
+        core.resize(size(columns));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(resized.recv_timeout(PATIENCE).unwrap().columns, 70);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        resized.is_empty(),
+        "the sizes before the last never reach the program"
+    );
 }

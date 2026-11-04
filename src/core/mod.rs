@@ -3,6 +3,7 @@
 pub(crate) mod command;
 pub(crate) mod listener;
 pub(crate) mod prefilter;
+pub(crate) mod prompt;
 pub(crate) mod pump;
 pub(crate) mod update;
 pub(crate) mod writer;

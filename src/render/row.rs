@@ -203,10 +203,12 @@ fn paint_row(
     let baseline = metrics.baseline as f32;
     if let Some(mut shaper) = shared.shaper.take() {
         for run in &pieces.texts {
-            let shaped =
-                shared
-                    .shaping
-                    .shape(&mut shaper, &run.text, run.bold, run.italic, &metrics);
+            let face = crate::render::shaping::RunFace {
+                bold: run.bold,
+                italic: run.italic,
+                emoji: run.emoji,
+            };
+            let shaped = shared.shaping.shape(&mut shaper, &run.text, face, &metrics);
             let color = to_color(run.color);
             let origin_x = metrics.column_x(run.column) as f32;
             for owned in shaped.iter() {

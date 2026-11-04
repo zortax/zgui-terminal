@@ -114,6 +114,19 @@ impl Default for ColorPalette {
 }
 
 impl ColorPalette {
+    /// The colour at `index` of the emulator's whole colour table.
+    ///
+    /// The first 256 entries are the indexed palette. The entries after them are the named
+    /// colours in the emulator's own order: the foreground, the background, the cursor, the eight
+    /// dim colours, the bright foreground and the dim foreground. A query for any of them reads
+    /// the same colour the grid is drawn in.
+    pub fn at(&self, index: usize) -> Rgba {
+        match u8::try_from(index) {
+            Ok(index) => self.indexed(index),
+            Err(_) => named_at(index).map_or(self.foreground, |name| self.named(name)),
+        }
+    }
+
     /// The colour at `index` of the 256-colour palette.
     pub fn indexed(&self, index: u8) -> Rgba {
         match index {
@@ -169,6 +182,26 @@ impl ColorPalette {
             NamedColor::DimForeground => self.foreground.mix(self.background, DIM_AMOUNT),
         }
     }
+}
+
+/// The named colour at `index` of the emulator's colour table, for an index past the palette.
+fn named_at(index: usize) -> Option<NamedColor> {
+    const NAMED: [NamedColor; 13] = [
+        NamedColor::Foreground,
+        NamedColor::Background,
+        NamedColor::Cursor,
+        NamedColor::DimBlack,
+        NamedColor::DimRed,
+        NamedColor::DimGreen,
+        NamedColor::DimYellow,
+        NamedColor::DimBlue,
+        NamedColor::DimMagenta,
+        NamedColor::DimCyan,
+        NamedColor::DimWhite,
+        NamedColor::BrightForeground,
+        NamedColor::DimForeground,
+    ];
+    NAMED.iter().copied().find(|name| *name as usize == index)
 }
 
 /// How far a dim colour is moved toward the background.
@@ -246,6 +279,12 @@ pub struct TerminalConfig {
     pub coalesce_window: Duration,
     /// How many messages one publish may collect.
     pub coalesce_limit: usize,
+    /// How long a new size rests before the grid and the program take it.
+    ///
+    /// A drag passes through many sizes. Each size the program hears of makes it draw again, and
+    /// each one the grid takes reflows the history. Only the size the drag rests at is applied.
+    /// The first size a terminal is given applies at once.
+    pub resize_settle: Duration,
 }
 
 impl Default for TerminalConfig {
@@ -271,6 +310,7 @@ impl Default for TerminalConfig {
             alt_sends_escape: true,
             coalesce_window: Duration::from_millis(4),
             coalesce_limit: 256,
+            resize_settle: Duration::from_millis(60),
         }
     }
 }

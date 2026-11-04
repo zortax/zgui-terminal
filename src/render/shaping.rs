@@ -20,8 +20,20 @@ struct RunKey {
     text: compact_str::CompactString,
     bold: bool,
     italic: bool,
+    emoji: bool,
     size: u32,
     generation: u32,
+}
+
+/// The face a run asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub struct RunFace {
+    /// Whether it is drawn heavier.
+    pub bold: bool,
+    /// Whether it is drawn sloped.
+    pub italic: bool,
+    /// Whether it is drawn as colour emoji.
+    pub emoji: bool,
 }
 
 /// One shaped run, and when it was last drawn.
@@ -34,6 +46,8 @@ struct Entry {
 pub struct ShapingCache {
     entries: FxHashMap<RunKey, Entry>,
     families: Vec<Ident>,
+    /// The same families with the colour emoji faces in front, for a cell drawn as an emoji.
+    emoji_families: Vec<Ident>,
     letter_spacing: f32,
     /// Counts the frames, so the least recently drawn entries are the ones let go.
     clock: u64,
@@ -46,6 +60,7 @@ impl ShapingCache {
     pub fn new(families: Vec<Ident>, letter_spacing: f32) -> Self {
         Self {
             entries: FxHashMap::default(),
+            emoji_families: crate::render::families::emoji_first(&families),
             families,
             letter_spacing,
             clock: 0,
@@ -56,6 +71,7 @@ impl ShapingCache {
 
     /// Shapes with `families` from now on, and lets go of everything shaped before.
     pub fn set_families(&mut self, families: Vec<Ident>, letter_spacing: f32) {
+        self.emoji_families = crate::render::families::emoji_first(&families);
         self.families = families;
         self.letter_spacing = letter_spacing;
         self.entries.clear();
@@ -81,19 +97,24 @@ impl ShapingCache {
         self.clock += 1;
     }
 
-    /// The runs `text` shapes into.
+    /// The runs `text` shapes into. Text drawn as an emoji tries the emoji faces first.
     pub fn shape(
         &mut self,
         shaper: &mut Shaper,
         text: &str,
-        bold: bool,
-        italic: bool,
+        style: RunFace,
         metrics: &CellMetrics,
     ) -> std::rc::Rc<Vec<ShapedRunOwned>> {
+        let RunFace {
+            bold,
+            italic,
+            emoji,
+        } = style;
         let key = RunKey {
             text: text.into(),
             bold,
             italic,
+            emoji,
             size: metrics.font_size,
             generation: metrics.generation,
         };
@@ -105,7 +126,12 @@ impl ShapingCache {
         }
 
         self.misses += 1;
-        let request = metrics.line_request(&self.families, bold, italic, self.letter_spacing);
+        let families = if emoji {
+            &self.emoji_families
+        } else {
+            &self.families
+        };
+        let request = metrics.line_request(families, bold, italic, self.letter_spacing);
         let runs = std::rc::Rc::new(shaper.shape_line(text, &request));
         if self.entries.len() >= CAPACITY {
             self.evict();
@@ -200,6 +226,7 @@ mod tests {
         let run = ShapedRunOwned {
             face: zgui::custom::FaceId(0),
             size: 16.0,
+            instance: zgui::custom::VariationInstance::DEFAULT,
             synthetic_bold: 0.0,
             synthetic_slant: 0.0,
             has_color: false,
@@ -215,6 +242,7 @@ mod tests {
         let run = ShapedRunOwned {
             face: zgui::custom::FaceId(0),
             size: 16.0,
+            instance: zgui::custom::VariationInstance::DEFAULT,
             synthetic_bold: 0.0,
             synthetic_slant: 0.0,
             has_color: false,

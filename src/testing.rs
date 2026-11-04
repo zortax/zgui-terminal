@@ -40,6 +40,12 @@ impl Core {
         self.inner.send(TerminalCommand::Paste(text));
     }
 
+    /// Draws with `config` from now on, the way a view does once it read a style sheet.
+    pub fn set_colors(&self, config: TerminalConfig) {
+        self.inner
+            .send(TerminalCommand::SetColors(Box::new(config)));
+    }
+
     /// Gives the grid a new size.
     pub fn resize(&self, size: TerminalSize) {
         self.inner.send(TerminalCommand::Resize(size));

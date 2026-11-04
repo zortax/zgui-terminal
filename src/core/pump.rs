@@ -22,7 +22,8 @@ use smallvec::SmallVec;
 use crate::config::TerminalConfig;
 use crate::core::command::{ClearMode, ScrollRequest, TerminalCommand, direction_of};
 use crate::core::listener::EventProxy;
-use crate::core::prefilter::Prefilter;
+use crate::core::prefilter::{Piece, Prefilter};
+use crate::core::prompt::PromptTracker;
 use crate::core::update::{ClipboardReply, FrameUpdate};
 use crate::core::writer::WriteRequest;
 use crate::event::{Hyperlink, MouseShape};
@@ -157,6 +158,8 @@ pub(crate) struct Pump {
     term: Arc<FairMutex<Term<EventProxy>>>,
     processor: Processor,
     prefilter: Prefilter,
+    /// Where the prompt the shell edits starts, which a resize keeps out of the reflow.
+    prompt: PromptTracker,
     builder: RowBuilder,
     config: TerminalConfig,
     /// Where replies to the program go.
@@ -180,6 +183,10 @@ pub(crate) struct Pump {
     overlay_sent: bool,
     /// The size the program was last told about.
     size: TerminalSize,
+    /// A size the view asked for that has not rested long enough to apply, and when it applies.
+    pending_size: Option<(TerminalSize, Instant)>,
+    /// Whether the grid has taken a size the view asked for.
+    sized: bool,
     /// The search in progress.
     search: Option<Search>,
     /// What the view knows about the search.
@@ -222,6 +229,7 @@ impl Pump {
             term: Arc::clone(&term),
             processor: Processor::new(),
             prefilter: Prefilter::new(),
+            prompt: PromptTracker::default(),
             builder,
             config,
             writer,
@@ -234,6 +242,8 @@ impl Pump {
             overlay: OverlaySnapshot::default(),
             overlay_sent: false,
             size,
+            pending_size: None,
+            sized: false,
             search: None,
             search_state: SearchState::default(),
             focused: false,
@@ -256,10 +266,24 @@ impl Pump {
     /// The first message of a batch is applied at once, which is what keeps a keystroke's echo
     /// quick. Everything that arrives inside the window after it joins the same frame, which is
     /// what keeps a flood from asking for a frame per read.
+    ///
+    /// A size waiting to rest bounds the wait, and applies when nothing newer came before it.
     pub fn run(mut self) {
         loop {
-            let Ok(first) = self.inbox.recv() else {
-                return;
+            let first = match self.pending_size {
+                Some((_, due)) => match self.inbox.recv_deadline(due) {
+                    Ok(message) => message,
+                    Err(flume::RecvTimeoutError::Timeout) => {
+                        self.apply_pending_size();
+                        self.publish();
+                        continue;
+                    }
+                    Err(flume::RecvTimeoutError::Disconnected) => return,
+                },
+                None => match self.inbox.recv() {
+                    Ok(message) => message,
+                    Err(_) => return,
+                },
             };
             if !self.apply(first) {
                 return;
@@ -279,6 +303,12 @@ impl Pump {
                     Err(_) => break,
                 }
             }
+            if self
+                .pending_size
+                .is_some_and(|(_, due)| due <= Instant::now())
+            {
+                self.apply_pending_size();
+            }
             self.publish();
         }
     }
@@ -289,9 +319,11 @@ impl Pump {
             PumpMessage::Bytes(bytes) => {
                 let term = &self.term;
                 let processor = &mut self.processor;
+                let prompt = &mut self.prompt;
                 let mut locked = term.lock();
-                self.prefilter.filter(&bytes, &mut |chunk| {
-                    processor.advance(&mut *locked, chunk);
+                self.prefilter.filter(&bytes, &mut |piece| match piece {
+                    Piece::Bytes(chunk) => processor.advance(&mut *locked, chunk),
+                    Piece::Mark(mark) => prompt.mark(mark, &locked),
                 });
                 drop(locked);
                 self.dirty = true;
@@ -319,8 +351,10 @@ impl Pump {
                 self.write(text.into_bytes());
             }
             Event::ColorRequest(index, format) => {
+                // A colour the program set answers for itself. Every other one answers with the
+                // colour the grid is drawn in, which is the styled palette once a view read it.
                 let color = self.term.lock().colors()[index].unwrap_or_else(|| {
-                    let fallback = self.config.colors.indexed(index as u8);
+                    let fallback = self.config.colors.at(index);
                     alacritty_terminal::vte::ansi::Rgb {
                         r: fallback.r,
                         g: fallback.g,
@@ -375,7 +409,7 @@ impl Pump {
             TerminalCommand::Write(bytes) => {
                 self.write(bytes);
             }
-            TerminalCommand::Resize(size) => self.resize(size),
+            TerminalCommand::Resize(size) => self.request_resize(size),
             TerminalCommand::Scroll(request) => self.scroll(request),
             TerminalCommand::ScrollTo(offset) => {
                 let mut term = self.term.lock();
@@ -548,14 +582,36 @@ impl Pump {
         }
     }
 
+    /// Takes a size the view asked for once it rests.
+    ///
+    /// The first size applies at once, because nothing was laid out at the size before it.
+    fn request_resize(&mut self, size: TerminalSize) {
+        if !self.sized || self.config.resize_settle.is_zero() {
+            self.sized = true;
+            self.pending_size = None;
+            self.resize(size);
+            return;
+        }
+        self.pending_size = Some((size, Instant::now() + self.config.resize_settle));
+    }
+
+    /// Applies the size that rested.
+    fn apply_pending_size(&mut self) {
+        if let Some((size, _)) = self.pending_size.take() {
+            self.resize(size);
+        }
+    }
+
     /// Gives the grid a new size, and tells the program about it.
+    ///
+    /// A prompt the shell edits stays out of the reflow, so the shell draws it again over itself.
     fn resize(&mut self, size: TerminalSize) {
         if size == self.size {
             return;
         }
         self.size = size;
         let dimensions = TermSize::new(usize::from(size.columns), usize::from(size.lines));
-        self.term.lock().resize(dimensions);
+        self.prompt.resize(&mut *self.term.lock(), dimensions);
         let _ = self.writer.send(WriteRequest::Resize(size));
         // The rows are laid out again from scratch: a resize reflows the history, so which line
         // is which no longer follows from what was published before.

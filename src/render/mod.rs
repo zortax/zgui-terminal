@@ -5,6 +5,7 @@ pub mod families;
 pub mod grid;
 pub mod metrics;
 pub mod palette;
+pub mod presentation;
 pub mod row;
 pub mod runs;
 pub mod shaping;

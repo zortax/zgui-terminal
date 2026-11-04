@@ -8,6 +8,11 @@
 //! What goes to the shaper is therefore the configured list with a set of families that are
 //! commonly installed added after it. The shaper takes the first that exists, and the ones after
 //! it still answer for a character the first cannot draw.
+//!
+//! Symbol faces come last. A terminal face rarely draws the media symbols, arrows and dingbats a
+//! program puts in its status line, and the fallback a shaper finds on its own for them is a
+//! colour emoji face or nothing. A monochrome symbol face in the list draws them as text in the
+//! cell colour. A cell that asks for the emoji presentation is shaped with the emoji faces first.
 
 use zgui::app::{LineRequest, Shaper};
 use zgui_interned::Ident;
@@ -38,6 +43,48 @@ const FALLBACKS: &[&str] = &[
     "monospace",
 ];
 
+/// The symbol faces tried after every text face.
+///
+/// Monochrome faces only, so a symbol with a text presentation keeps the colour of its cell.
+const SYMBOLS: &[&str] = &[
+    "Symbols Nerd Font Mono",
+    "Symbols Nerd Font",
+    "Noto Sans Symbols 2",
+    "Noto Sans Symbols",
+    "Noto Sans Math",
+    "DejaVu Sans",
+    "Adwaita Mono",
+    "Segoe UI Symbol",
+    "Apple Symbols",
+    "STIX Two Math",
+    "FreeSerif",
+    "FreeMono",
+    "Unifont",
+];
+
+/// The colour emoji faces, tried first for a cell drawn as an emoji.
+const EMOJI: &[&str] = &[
+    "Noto Color Emoji",
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
+    "Twemoji",
+    "Twemoji Mozilla",
+    "JoyPixels",
+    "OpenMoji Color",
+    "EmojiOne Color",
+];
+
+/// The families a cell drawn as an emoji is shaped with: the emoji faces, then `families`.
+pub fn emoji_first(families: &[Ident]) -> Vec<Ident> {
+    let mut names: Vec<Ident> = EMOJI.iter().map(|name| Ident::new(name)).collect();
+    for family in families {
+        if !names.contains(family) {
+            names.push(*family);
+        }
+    }
+    names
+}
+
 /// Whether `name` is a generic that names no face of its own.
 fn is_generic(name: &str) -> bool {
     matches!(
@@ -62,15 +109,22 @@ pub fn resolve(shaper: &Shaper, wanted: &[String], size_device_px: f32) -> Vec<I
             names.push((*name).to_owned());
         }
     }
+    // The faces a cell can be measured from end here. The symbol faces only fill in characters.
+    let text_faces = names.len();
+    for name in SYMBOLS {
+        if !names.iter().any(|held| held == name) {
+            names.push((*name).to_owned());
+        }
+    }
 
     let families: Vec<Ident> = names.iter().map(|name| Ident::new(name)).collect();
-    if resolves(shaper, &families, size_device_px) {
+    if resolves(shaper, &families[..text_faces], size_device_px) {
         return families;
     }
 
     // Nothing in the list as a whole. Whichever one of them exists on its own is still better
     // than drawing no text.
-    for (index, name) in names.iter().enumerate() {
+    for (index, name) in names.iter().enumerate().take(text_faces) {
         if is_generic(name) {
             continue;
         }
@@ -110,6 +164,22 @@ mod tests {
         assert!(is_generic("monospace"));
         assert!(is_generic("ui-monospace"));
         assert!(!is_generic("JetBrains Mono"));
+    }
+
+    #[test]
+    fn the_symbol_faces_are_monochrome() {
+        for name in SYMBOLS {
+            assert!(!EMOJI.contains(name), "{name}");
+            assert!(!name.contains("Emoji"), "{name}");
+        }
+    }
+
+    #[test]
+    fn an_emoji_cell_tries_the_emoji_faces_before_the_text_faces() {
+        let text = [Ident::new("Geist Mono"), Ident::new("Noto Sans Symbols 2")];
+        let families = emoji_first(&text);
+        assert_eq!(families[0], Ident::new("Noto Color Emoji"));
+        assert_eq!(&families[EMOJI.len()..], &text);
     }
 
     #[test]

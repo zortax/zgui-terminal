@@ -7,7 +7,7 @@
 use smallvec::SmallVec;
 
 use crate::config::{ColorPalette, Rgba};
-use crate::render::boxchars;
+use crate::render::{boxchars, presentation};
 use crate::snapshot::{CursorSnapshot, MatchKind, RowOverlay, RowSnapshot, RunFlags, RunStyle};
 
 /// A stretch of background of one colour.
@@ -45,6 +45,8 @@ pub struct TextRun {
     pub bold: bool,
     /// Whether it is drawn sloped.
     pub italic: bool,
+    /// Whether it is drawn as colour emoji, which a run of text never mixes with plain text.
+    pub emoji: bool,
 }
 
 /// A line drawn under or through a stretch of text.
@@ -282,8 +284,12 @@ pub fn pieces(row: &RowSnapshot, overlay: &RowOverlay, context: RowContext<'_>) 
         } else {
             let bold = look.style.flags.contains(RunFlags::BOLD);
             let italic = look.style.flags.contains(RunFlags::ITALIC);
+            let emoji = presentation::is_emoji(&look.text);
             let extends = text.as_ref().is_some_and(|run: &TextRun| {
-                run.color == look.style.foreground && run.bold == bold && run.italic == italic
+                run.color == look.style.foreground
+                    && run.bold == bold
+                    && run.italic == italic
+                    && run.emoji == emoji
             });
             match text.as_mut() {
                 Some(run) if extends => run.text.push_str(&look.text),
@@ -295,6 +301,7 @@ pub fn pieces(row: &RowSnapshot, overlay: &RowOverlay, context: RowContext<'_>) 
                         color: look.style.foreground,
                         bold,
                         italic,
+                        emoji,
                     });
                 }
             }
