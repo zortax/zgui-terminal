@@ -153,23 +153,21 @@ impl CellMetrics {
         self.width * u32::from(column)
     }
 
-    /// The request that shapes text at these measurements.
+    /// The request that shapes text at these measurements, set as `face` says.
     pub fn line_request<'a>(
         &self,
         families: &'a [zgui_interned::Ident],
         bold: bool,
         italic: bool,
-        letter_spacing: f32,
+        face: &crate::render::shaping::FaceSettings,
     ) -> LineRequest<'a> {
         LineRequest {
             families,
-            weight: if bold { 700 } else { 400 },
+            weight: face.weight_of(bold),
             italic,
             size_device_px: self.font_size as f32,
-            letter_spacing,
-            // A ligature draws two characters as one glyph and takes one cell doing it, which is
-            // exactly wrong for a grid.
-            ligatures: false,
+            letter_spacing: face.letter_spacing,
+            ligatures: face.ligatures,
         }
     }
 }

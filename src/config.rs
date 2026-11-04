@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use alacritty_terminal::vte::ansi::{CursorShape, NamedColor};
+pub use zgui::app::{FontFeature, FontVariation};
 
 /// A colour, as the emulator resolves one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -238,6 +239,21 @@ pub struct TerminalConfig {
     pub font_family: Vec<String>,
     /// The size to draw at, in CSS pixels.
     pub font_size: f32,
+    /// The weight of ordinary text, as a CSS weight from 1 to 1000.
+    pub font_weight: u16,
+    /// The weight of bold text, as a CSS weight from 1 to 1000.
+    pub bold_weight: u16,
+    /// Whether the face's ligatures and contextual alternates are shaped.
+    ///
+    /// Off by default. A ligature takes the cells of the characters it joins only in a face drawn
+    /// for that, such as a programming face with ligatures.
+    pub ligatures: bool,
+    /// OpenType features on top of the ligature switch, in order: stylistic sets, a slashed zero
+    /// and the like. A feature named here outranks the switch for the same tag.
+    pub font_features: Vec<FontFeature>,
+    /// Coordinates on the axes of a variable face, in order. An axis named here outranks the one
+    /// the weight implies.
+    pub font_variations: Vec<FontVariation>,
     /// How tall a line is, as a multiple of the face's own line height.
     pub line_height: f32,
     /// Extra space between cells, in CSS pixels.
@@ -292,6 +308,11 @@ impl Default for TerminalConfig {
         Self {
             font_family: vec!["monospace".to_owned()],
             font_size: 14.0,
+            font_weight: 400,
+            bold_weight: 700,
+            ligatures: false,
+            font_features: Vec::new(),
+            font_variations: Vec::new(),
             line_height: 1.2,
             letter_spacing: 0.0,
             padding: 6.0,

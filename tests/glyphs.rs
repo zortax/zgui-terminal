@@ -6,9 +6,10 @@
 use zgui::app::{Fonts, Shaper};
 use zgui::text::FontSource;
 use zgui_terminal::CellMetrics;
+use zgui_terminal::TerminalConfig;
 use zgui_terminal::render::families;
 use zgui_terminal::render::presentation;
-use zgui_terminal::render::shaping::{RunFace, ShapingCache};
+use zgui_terminal::render::shaping::{FaceSettings, RunFace, ShapingCache};
 
 /// The faces leash asks for, which is a common shape for a configuration.
 const WANTED: [&str; 3] = ["Geist Mono", "DejaVu Sans Mono", "monospace"];
@@ -22,7 +23,7 @@ fn setup() -> (Fonts, Shaper, ShapingCache, CellMetrics) {
     let shaper = fonts.shaper();
     let wanted: Vec<String> = WANTED.iter().map(|name| (*name).to_owned()).collect();
     let resolved = families::resolve(&shaper, &wanted, SIZE);
-    let cache = ShapingCache::new(resolved, 0.0);
+    let cache = ShapingCache::new(resolved, FaceSettings::default());
     let metrics = CellMetrics {
         font_size: SIZE as u32,
         ..CellMetrics::default()
@@ -108,4 +109,42 @@ fn letters_still_draw_from_the_terminal_face() {
         assert!(real && !color, "{family}");
         assert_eq!(family, "DejaVu Sans Mono");
     }
+}
+
+/// The face `text` is drawn from with `face`, in the family `family`, as plain or bold text.
+fn face_of(family: &str, face: FaceSettings, bold: bool) -> (zgui::text::FaceId, bool) {
+    let fonts = Fonts::system();
+    let mut shaper = fonts.shaper();
+    let resolved = families::resolve(&shaper, &[family.to_owned()], SIZE);
+    let mut cache = ShapingCache::new(resolved, face);
+    let metrics = CellMetrics {
+        font_size: SIZE as u32,
+        ..CellMetrics::default()
+    };
+    let style = RunFace {
+        bold,
+        ..RunFace::default()
+    };
+    let runs = cache.shape(&mut shaper, "abc", style, &metrics);
+    (runs[0].face, runs[0].synthetic_bold > 0.0)
+}
+
+#[test]
+fn the_configured_weights_choose_the_face_of_plain_and_bold_text() {
+    let shaper = Fonts::system().shaper();
+    if !installed(&shaper, "Adwaita Mono") {
+        eprintln!("Adwaita Mono is not installed");
+        return;
+    }
+    let normal = FaceSettings::default();
+    let heavy = FaceSettings::of(&TerminalConfig {
+        font_weight: 700,
+        bold_weight: 400,
+        ..TerminalConfig::default()
+    });
+    let regular = face_of("Adwaita Mono", normal.clone(), false);
+    let bold = face_of("Adwaita Mono", normal, true);
+    assert_ne!(regular, bold, "bold text draws from a heavier face");
+    assert_eq!(face_of("Adwaita Mono", heavy.clone(), false), bold);
+    assert_eq!(face_of("Adwaita Mono", heavy, true), regular);
 }

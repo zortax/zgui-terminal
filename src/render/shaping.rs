@@ -5,10 +5,11 @@
 //! and none of that work changes between one frame and the next, so it is kept.
 
 use rustc_hash::FxHashMap;
-use zgui::app::Shaper;
+use zgui::app::{FontFeature, FontVariation, LineSettings, Shaper};
 use zgui::custom::ShapedRunOwned;
 use zgui_interned::Ident;
 
+use crate::config::TerminalConfig;
 use crate::render::CellMetrics;
 
 /// How many entries the cache holds before it starts letting go.
@@ -36,6 +37,57 @@ pub struct RunFace {
     pub emoji: bool,
 }
 
+/// How the text of the cells is set: the weights, the spacing, the ligatures and the OpenType
+/// settings.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FaceSettings {
+    /// The weight of ordinary text.
+    pub weight: u16,
+    /// The weight of bold text.
+    pub bold_weight: u16,
+    /// Extra space after every glyph.
+    pub letter_spacing: f32,
+    /// Whether ligatures and contextual alternates are shaped.
+    pub ligatures: bool,
+    /// The OpenType features on top of the ligature switch.
+    pub features: Vec<FontFeature>,
+    /// The coordinates on the axes of a variable face.
+    pub variations: Vec<FontVariation>,
+}
+
+impl Default for FaceSettings {
+    fn default() -> Self {
+        Self::of(&TerminalConfig::default())
+    }
+}
+
+impl FaceSettings {
+    /// The settings `config` asks for, with the weights held to the CSS range.
+    pub fn of(config: &TerminalConfig) -> Self {
+        Self {
+            weight: config.font_weight.clamp(1, 1000),
+            bold_weight: config.bold_weight.clamp(1, 1000),
+            letter_spacing: config.letter_spacing,
+            ligatures: config.ligatures,
+            features: config.font_features.clone(),
+            variations: config.font_variations.clone(),
+        }
+    }
+
+    /// The weight a run is shaped at.
+    pub fn weight_of(&self, bold: bool) -> u16 {
+        if bold { self.bold_weight } else { self.weight }
+    }
+
+    /// The OpenType settings every run is shaped with.
+    pub fn line_settings(&self) -> LineSettings<'_> {
+        LineSettings {
+            features: &self.features,
+            variations: &self.variations,
+        }
+    }
+}
+
 /// One shaped run, and when it was last drawn.
 struct Entry {
     runs: std::rc::Rc<Vec<ShapedRunOwned>>,
@@ -48,7 +100,7 @@ pub struct ShapingCache {
     families: Vec<Ident>,
     /// The same families with the colour emoji faces in front, for a cell drawn as an emoji.
     emoji_families: Vec<Ident>,
-    letter_spacing: f32,
+    face: FaceSettings,
     /// Counts the frames, so the least recently drawn entries are the ones let go.
     clock: u64,
     hits: u64,
@@ -56,30 +108,37 @@ pub struct ShapingCache {
 }
 
 impl ShapingCache {
-    /// A cache that shapes with `families`, which are already resolved to faces that exist.
-    pub fn new(families: Vec<Ident>, letter_spacing: f32) -> Self {
+    /// A cache that shapes with `families`, which are already resolved to faces that exist, set
+    /// as `face` says.
+    pub fn new(families: Vec<Ident>, face: FaceSettings) -> Self {
         Self {
             entries: FxHashMap::default(),
             emoji_families: crate::render::families::emoji_first(&families),
             families,
-            letter_spacing,
+            face,
             clock: 0,
             hits: 0,
             misses: 0,
         }
     }
 
-    /// Shapes with `families` from now on, and lets go of everything shaped before.
-    pub fn set_families(&mut self, families: Vec<Ident>, letter_spacing: f32) {
+    /// Shapes with `families` set as `face` says from now on, and lets go of everything shaped
+    /// before.
+    pub fn set_families(&mut self, families: Vec<Ident>, face: FaceSettings) {
         self.emoji_families = crate::render::families::emoji_first(&families);
         self.families = families;
-        self.letter_spacing = letter_spacing;
+        self.face = face;
         self.entries.clear();
     }
 
     /// The families in force.
     pub fn families(&self) -> &[Ident] {
         &self.families
+    }
+
+    /// The settings in force.
+    pub fn face(&self) -> &FaceSettings {
+        &self.face
     }
 
     /// Lets go of everything, which a change of size or scale makes necessary.
@@ -131,8 +190,9 @@ impl ShapingCache {
         } else {
             &self.families
         };
-        let request = metrics.line_request(families, bold, italic, self.letter_spacing);
-        let runs = std::rc::Rc::new(shaper.shape_line(text, &request));
+        let request = metrics.line_request(families, bold, italic, &self.face);
+        let runs =
+            std::rc::Rc::new(shaper.shape_line_with(text, &request, &self.face.line_settings()));
         if self.entries.len() >= CAPACITY {
             self.evict();
         }
@@ -204,6 +264,30 @@ fn is_zero_width(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_carry_the_weights_and_the_features_of_the_configuration() {
+        let feature = FontFeature {
+            tag: u32::from_be_bytes(*b"zero"),
+            value: 1,
+        };
+        let config = TerminalConfig {
+            font_weight: 0,
+            bold_weight: 1200,
+            ligatures: true,
+            font_features: vec![feature],
+            ..TerminalConfig::default()
+        };
+        let face = FaceSettings::of(&config);
+        assert_eq!(face.weight_of(false), 1, "held to the CSS range");
+        assert_eq!(face.weight_of(true), 1000);
+        assert_eq!(face.line_settings().features, &[feature]);
+        assert!(face.line_settings().variations.is_empty());
+
+        let request = CellMetrics::default().line_request(&[], true, false, &face);
+        assert_eq!(request.weight, 1000);
+        assert!(request.ligatures);
+    }
 
     #[test]
     fn plain_text_takes_one_cell_per_character() {

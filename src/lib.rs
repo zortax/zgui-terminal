@@ -62,7 +62,7 @@ mod handle;
 mod view;
 
 pub use crate::clipboard::{Clipboard, ClipboardReply, InProcessClipboard};
-pub use crate::config::{ColorPalette, CursorConfig, TerminalConfig};
+pub use crate::config::{ColorPalette, CursorConfig, FontFeature, FontVariation, TerminalConfig};
 pub use crate::event::{Hyperlink, MouseShape, TerminalEvent};
 pub use crate::grid::{
     AppCursor, Contents, GridPoint, GridSpan, Input, PointFilter, PointerPhase, SpanKind,

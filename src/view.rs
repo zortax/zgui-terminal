@@ -23,7 +23,7 @@ use crate::input::mouse::{MouseReport, encode as encode_mouse};
 use crate::render::CellMetrics;
 use crate::render::grid::{GridElement, GridLayout};
 use crate::render::row::{RowElement, RowShared};
-use crate::render::shaping::ShapingCache;
+use crate::render::shaping::{FaceSettings, ShapingCache};
 use crate::scroll::{ScrollRequest, ScrollState, WheelAction, lines_from_pixels, wheel_action};
 use crate::search::SearchState;
 use crate::selection::{ClickCounter, button_selects, selection_type, selects_rather_than_reports};
@@ -201,7 +201,7 @@ pub fn Terminal(
         columns: 80,
         builtin_glyphs: config.builtin_glyphs,
         blink_visible: true,
-        shaping: ShapingCache::new(families.clone(), config.letter_spacing),
+        shaping: ShapingCache::new(families.clone(), FaceSettings::of(&config)),
         shaper,
     }));
     let layout = Rc::new(RefCell::new(GridLayout {
@@ -457,7 +457,9 @@ pub fn Terminal(
                 shared.shaper = shaper;
                 shared.metrics = metrics;
                 shared.builtin_glyphs = config.builtin_glyphs;
-                shared.shaping.set_families(families, config.letter_spacing);
+                shared
+                    .shaping
+                    .set_families(families, FaceSettings::of(&config));
                 drop(shared);
 
                 let mut layout = layout.borrow_mut();
@@ -1059,9 +1061,13 @@ fn measure_cell(
     let (Some(shaper), false) = (shaper, families.is_empty()) else {
         return fallback;
     };
+    // Measured at the regular weight and with the OpenType settings, so a variable face's width
+    // axis or a heavier instance's advance is the one the cells are sized from.
+    let face = FaceSettings::of(config);
     let mut request = crate::render::families::request(families, size);
     request.letter_spacing = config.letter_spacing * scale;
-    match shaper.line_metrics(&request) {
+    request.weight = face.weight;
+    match shaper.line_metrics_with(&request, &face.line_settings()) {
         Some(metrics) => CellMetrics::from_face(
             &metrics,
             size,
