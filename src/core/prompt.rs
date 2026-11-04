@@ -10,7 +10,9 @@
 //! number of rows below the prompt start, and the old rows come back unreflowed. The shell then
 //! draws the prompt over them at the new width.
 //!
-//! A view scrolled into the history keeps the line at its top across the resize.
+//! A view scrolled into the history keeps the line at its top across the resize. A view at the
+//! bottom keeps the line at the top of the screen, as far as blank rows below the cursor make
+//! room.
 
 use alacritty_terminal::Term;
 use alacritty_terminal::grid::{Dimensions, Row};
@@ -19,6 +21,7 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 
 use crate::core::anchor::Anchor;
+use crate::core::growth::Top;
 use crate::core::prefilter::PromptMark;
 
 /// Where the prompt the shell edits now starts.
@@ -58,9 +61,13 @@ impl PromptTracker {
     pub fn resize<T, S: Dimensions>(&mut self, term: &mut Term<T>, size: S) {
         let Some(start) = self.start_on_screen(term) else {
             let anchor = Anchor::of(term.grid());
+            let top = Top::of(term.grid());
             term.resize(size);
             if let Some(anchor) = anchor {
                 anchor.restore(term.grid_mut());
+            }
+            if let Some(top) = top {
+                top.keep(term.grid_mut());
             }
             return;
         };
@@ -93,6 +100,7 @@ impl PromptTracker {
 
         // Read with the prompt rows blank, which is how the grid reflows them.
         let anchor = Anchor::of(term.grid());
+        let kept_top = Top::of(term.grid());
         term.resize(size);
 
         let grid = term.grid_mut();
@@ -117,7 +125,11 @@ impl PromptTracker {
         if let Some(anchor) = anchor {
             anchor.restore(grid);
         }
+        // Rows that come back from the history keep their count from its oldest line.
         self.start = Some(term.history_size() + top);
+        if let Some(kept_top) = kept_top {
+            kept_top.keep(term.grid_mut());
+        }
     }
 }
 
@@ -296,6 +308,23 @@ mod tests {
         let screen = shell.screen();
         assert_eq!(screen[0], "output");
         assert_eq!(screen[1], PROMPT);
+    }
+
+    #[test]
+    fn output_that_wraps_above_the_prompt_grows_downward() {
+        let mut shell = Shell::new(40, 10);
+        shell.write(b"first\r\n");
+        shell.write(PROMPT.as_bytes());
+        shell.write(b"\r\n\x1b]133;A\x07");
+        shell.write(PROMPT.as_bytes());
+        shell.resize(20, 10);
+        shell.redraw(0, PROMPT);
+        let screen = shell.screen();
+        assert_eq!(screen[0], "first", "{screen:?}");
+        assert_eq!(screen[1], &PROMPT[..20]);
+        assert_eq!(screen[2], &PROMPT[20..]);
+        assert_eq!(screen[3], &PROMPT[..20]);
+        assert_eq!(shell.term.grid().history_size(), 0);
     }
 
     #[test]

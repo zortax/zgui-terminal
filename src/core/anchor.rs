@@ -53,7 +53,7 @@ impl Anchor {
 }
 
 /// Whether the row above `line` wraps into it.
-fn continues(grid: &Grid<Cell>, line: Line) -> bool {
+pub(crate) fn continues(grid: &Grid<Cell>, line: Line) -> bool {
     line > grid.topmost_line()
         && grid[line - 1usize][Column(grid.columns() - 1)]
             .flags
@@ -61,7 +61,7 @@ fn continues(grid: &Grid<Cell>, line: Line) -> bool {
 }
 
 /// The first row of the line `line` is part of.
-fn line_start(grid: &Grid<Cell>, mut line: Line) -> Line {
+pub(crate) fn line_start(grid: &Grid<Cell>, mut line: Line) -> Line {
     while continues(grid, line) {
         line -= 1;
     }
@@ -69,7 +69,7 @@ fn line_start(grid: &Grid<Cell>, mut line: Line) -> Line {
 }
 
 /// The last row of the line that starts at `start`.
-fn line_end(grid: &Grid<Cell>, mut line: Line) -> Line {
+pub(crate) fn line_end(grid: &Grid<Cell>, mut line: Line) -> Line {
     while line < grid.bottommost_line() && continues(grid, line + 1) {
         line += 1;
     }
@@ -77,7 +77,7 @@ fn line_end(grid: &Grid<Cell>, mut line: Line) -> Line {
 }
 
 /// How many lines start after `start`, up to and including `last`.
-fn starts_between(grid: &Grid<Cell>, start: Line, last: Line) -> usize {
+pub(crate) fn starts_between(grid: &Grid<Cell>, start: Line, last: Line) -> usize {
     let mut count = 0;
     let mut line = start + 1;
     while line <= last {

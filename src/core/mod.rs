@@ -2,6 +2,7 @@
 
 pub(crate) mod anchor;
 pub(crate) mod command;
+pub(crate) mod growth;
 pub(crate) mod listener;
 pub(crate) mod prefilter;
 pub(crate) mod prompt;
