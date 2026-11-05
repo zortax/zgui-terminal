@@ -19,7 +19,7 @@ use crate::event::{MouseShape, TerminalEvent};
 use crate::grid::{Input, PointFilter, PointerPhase};
 use crate::handle::TerminalHandle;
 use crate::input::keyboard::{KeyBindings, KeyState, encode_key};
-use crate::input::mouse::{MouseReport, encode as encode_mouse};
+use crate::input::mouse::{HeldButtons, MouseReport, encode as encode_mouse};
 use crate::render::CellMetrics;
 use crate::render::grid::{GridElement, GridLayout};
 use crate::render::row::{RowElement, RowShared};
@@ -593,6 +593,9 @@ pub fn Terminal(
     let dragging = Rc::new(std::cell::Cell::new(false));
     let dragging_bar = Rc::new(std::cell::Cell::new(false));
     let wheel_remainder = Rc::new(std::cell::Cell::new(0.0f32));
+    // The buttons the program was told are down, and the cell it last heard the pointer was in.
+    let held = Rc::new(std::cell::Cell::new(HeldButtons::default()));
+    let reported_cell = Rc::new(std::cell::Cell::new(None::<(usize, usize)>));
 
     let pointer_down = {
         let session = session.clone();
@@ -602,6 +605,8 @@ pub fn Terminal(
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
         let pointing = Rc::clone(&pointing);
+        let held = Rc::clone(&held);
+        let reported_cell = Rc::clone(&reported_cell);
         let on_point = on_point.clone();
         move |cx: &mut EventCx<'_, events::PointerDown>| {
             let Some(bounds) = port.window_bounds() else {
@@ -682,6 +687,14 @@ pub fn Terminal(
                 )
             {
                 session.send(TerminalCommand::Write(bytes.to_vec()));
+                reported_cell.set(Some((point.column, point.row)));
+                let mut buttons = held.get();
+                if buttons.press(cx.button.unwrap_or_default()) {
+                    held.set(buttons);
+                    // The program is told about the moves and the release of this button, also
+                    // where they happen outside the terminal.
+                    cx.capture_pointer();
+                }
             }
             cx.request_focus(cx.current);
         }
@@ -693,6 +706,8 @@ pub fn Terminal(
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
         let pointing = Rc::clone(&pointing);
+        let held = Rc::clone(&held);
+        let reported_cell = Rc::clone(&reported_cell);
         let on_point = on_point.clone();
         move |cx: &mut EventCx<'_, events::PointerMove>| {
             let Some(bounds) = port.window_bounds() else {
@@ -728,15 +743,19 @@ pub fn Terminal(
             }
             let mode = session.mode();
             session.send(TerminalCommand::HyperlinkAt(Some(point.grid)));
+            // A move is reported once per cell, with the button the program was told is down.
+            let cell = (point.column, point.row);
             if input.get_untracked().is_live()
+                && reported_cell.get() != Some(cell)
                 && let Some(bytes) = encode_mouse(
-                    MouseReport::Motion(cx.button),
+                    MouseReport::Motion(held.get().reported()),
                     point.column,
                     point.row,
                     cx.modifiers,
                     mode,
                 )
             {
+                reported_cell.set(Some(cell));
                 session.send(TerminalCommand::Write(bytes.to_vec()));
             }
         }
@@ -748,13 +767,18 @@ pub fn Terminal(
         let dragging = Rc::clone(&dragging);
         let dragging_bar = Rc::clone(&dragging_bar);
         let pointing = Rc::clone(&pointing);
+        let held = Rc::clone(&held);
+        let reported_cell = Rc::clone(&reported_cell);
         let on_point = on_point.clone();
         let config = config.clone();
         move |cx: &mut EventCx<'_, events::PointerUp>| {
             let was_dragging = dragging.replace(false);
             let was_bar = dragging_bar.replace(false);
             let was_pointing = pointing.replace(false);
-            if was_dragging || was_bar || was_pointing {
+            let mut buttons = held.get();
+            let was_reported = buttons.release(cx.button.unwrap_or_default());
+            held.set(buttons);
+            if was_dragging || was_bar || was_pointing || (was_reported && buttons.is_empty()) {
                 cx.release_pointer();
             }
             if was_bar {
@@ -793,7 +817,56 @@ pub fn Terminal(
                     mode,
                 )
             {
+                reported_cell.set(Some((point.column, point.row)));
                 session.send(TerminalCommand::Write(bytes.to_vec()));
+            }
+        }
+    };
+
+    // A gesture something else took over ends here. A button the program was told is down is
+    // reported up, so the program does not keep it held.
+    let pointer_cancel = {
+        let session = session.clone();
+        let layout = Rc::clone(&layout);
+        let dragging = Rc::clone(&dragging);
+        let dragging_bar = Rc::clone(&dragging_bar);
+        let pointing = Rc::clone(&pointing);
+        let held = Rc::clone(&held);
+        let on_point = on_point.clone();
+        move |cx: &mut EventCx<'_, events::PointerCancel>| {
+            let was_dragging = dragging.replace(false);
+            let was_bar = dragging_bar.replace(false);
+            let was_pointing = pointing.replace(false);
+            let mut buttons = held.replace(HeldButtons::default());
+            if was_dragging || was_bar || was_pointing || !buttons.is_empty() {
+                cx.release_pointer();
+            }
+            let point = port.window_bounds().and_then(|bounds| {
+                let scale = port.scale();
+                let inside = (
+                    cx.position.x.0 * scale - bounds.origin.x.0,
+                    cx.position.y.0 * scale - bounds.origin.y.0,
+                );
+                grid_point(inside, &layout)
+            });
+            let Some(point) = point else {
+                return;
+            };
+            if was_pointing && let Some(filter) = on_point.as_ref() {
+                filter(point.point(&layout), PointerPhase::Up);
+            }
+            let mode = session.mode();
+            while let Some(button) = buttons.reported() {
+                buttons.release(button);
+                if let Some(bytes) = encode_mouse(
+                    MouseReport::Release(button),
+                    point.column,
+                    point.row,
+                    Modifiers::NONE,
+                    mode,
+                ) {
+                    session.send(TerminalCommand::Write(bytes.to_vec()));
+                }
             }
         }
     };
@@ -959,6 +1032,7 @@ pub fn Terminal(
             on:pointer_down = pointer_down,
             on:pointer_move = pointer_move,
             on:pointer_up = pointer_up,
+            on:pointer_cancel = pointer_cancel,
             on:wheel = wheel,
             on:focus_in = focus_in,
             on:focus_out = focus_out,

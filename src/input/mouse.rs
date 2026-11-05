@@ -129,6 +129,51 @@ fn push_number(bytes: &mut Report, value: u32) {
     }
 }
 
+/// The buttons a program was told went down and has not yet been told came up.
+///
+/// A move reports the lowest of them, as xterm does, so a program sees a drag with the button
+/// that started it. The pointer events of a move carry no button of their own.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeldButtons(u8);
+
+impl HeldButtons {
+    /// Records that the program was told `button` went down. Answers whether it is one the
+    /// protocol can name.
+    pub fn press(&mut self, button: PointerButton) -> bool {
+        let Some(number) = button_number(button) else {
+            return false;
+        };
+        self.0 |= 1 << number;
+        true
+    }
+
+    /// Records that `button` came up. Answers whether the program had been told it was down.
+    pub fn release(&mut self, button: PointerButton) -> bool {
+        let Some(number) = button_number(button) else {
+            return false;
+        };
+        let held = self.0 & (1 << number) != 0;
+        self.0 &= !(1 << number);
+        held
+    }
+
+    /// The button a move reports, when any is held.
+    pub fn reported(self) -> Option<PointerButton> {
+        [
+            PointerButton::Primary,
+            PointerButton::Middle,
+            PointerButton::Secondary,
+        ]
+        .into_iter()
+        .find(|button| button_number(*button).is_some_and(|number| self.0 & (1 << number) != 0))
+    }
+
+    /// Whether no button is held.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// Which cell a point inside the grid falls in.
 ///
 /// Both answers are clamped to the grid, so a pointer dragged past an edge selects to that edge
@@ -290,6 +335,46 @@ mod tests {
         )
         .expect("a report");
         assert_eq!(report.as_slice(), &[0x1b, b'[', b'M', 32 + 3, 33, 33]);
+    }
+
+    #[test]
+    fn a_move_while_a_button_is_held_reports_that_button() {
+        let mut held = HeldButtons::default();
+        assert_eq!(held.reported(), None);
+        assert!(held.press(PointerButton::Primary));
+        let mode = TermMode::MOUSE_REPORT_CLICK
+            | TermMode::SGR_MOUSE
+            | TermMode::MOUSE_DRAG
+            | TermMode::MOUSE_MOTION;
+        let report = encode(
+            MouseReport::Motion(held.reported()),
+            3,
+            4,
+            Modifiers::default(),
+            mode,
+        )
+        .expect("a report");
+        assert_eq!(report.as_slice(), b"\x1b[<32;4;5M");
+    }
+
+    #[test]
+    fn the_lowest_held_button_is_the_one_a_move_reports() {
+        let mut held = HeldButtons::default();
+        held.press(PointerButton::Secondary);
+        held.press(PointerButton::Middle);
+        assert_eq!(held.reported(), Some(PointerButton::Middle));
+        assert!(held.release(PointerButton::Middle));
+        assert_eq!(held.reported(), Some(PointerButton::Secondary));
+        assert!(held.release(PointerButton::Secondary));
+        assert!(held.is_empty());
+    }
+
+    #[test]
+    fn a_button_the_program_never_heard_of_is_not_held() {
+        let mut held = HeldButtons::default();
+        assert!(!held.press(PointerButton::Back));
+        assert!(!held.release(PointerButton::Primary));
+        assert!(held.is_empty());
     }
 
     #[test]
