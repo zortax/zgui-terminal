@@ -46,6 +46,13 @@ impl Core {
             .send(TerminalCommand::SetColors(Box::new(config)));
     }
 
+    /// Draws with the colours of `scheme`, the way a session no view draws is told of a new
+    /// colour scheme.
+    pub fn set_scheme(&self, scheme: crate::config::SchemeColors) {
+        self.inner
+            .send(TerminalCommand::SetScheme(Box::new(scheme)));
+    }
+
     /// Gives the grid a new size.
     pub fn resize(&self, size: TerminalSize) {
         self.inner.send(TerminalCommand::Resize(size));

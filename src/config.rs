@@ -81,7 +81,33 @@ pub struct ColorPalette {
     pub ansi: [Rgba; 16],
 }
 
+/// The colours a colour scheme names: the text, the background, the cursor and the sixteen named
+/// colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SchemeColors {
+    /// The colour text is drawn in.
+    pub foreground: Rgba,
+    /// The background behind everything.
+    pub background: Rgba,
+    /// The colour the cursor is drawn in.
+    pub cursor: Rgba,
+    /// The eight normal colours, then the eight bright ones.
+    pub ansi: [Rgba; 16],
+}
+
 impl ColorPalette {
+    /// This palette with the colours of `scheme` in place of its own.
+    #[must_use]
+    pub fn with_scheme(self, scheme: SchemeColors) -> Self {
+        Self {
+            foreground: scheme.foreground,
+            background: scheme.background,
+            cursor: scheme.cursor,
+            ansi: scheme.ansi,
+            ..self
+        }
+    }
+
     /// Whether the text is lighter than the background, by the Rec. 601 luma.
     pub fn is_dark(&self) -> bool {
         let luma = |color: Rgba| {

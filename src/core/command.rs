@@ -86,6 +86,8 @@ pub(crate) enum TerminalCommand {
     SetConfig(Box<crate::config::TerminalConfig>),
     /// Draw with new colours, leaving everything else as it is.
     SetColors(Box<crate::config::TerminalConfig>),
+    /// Draw with the colours of a new colour scheme, leaving the other colours as they are.
+    SetScheme(Box<crate::config::SchemeColors>),
     /// Whether the terminal has focus, which the cursor and focus reporting need.
     SetFocus(bool),
     /// Draw this cursor in place of the program's, or the program's again when there is none.

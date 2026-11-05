@@ -35,7 +35,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::config::TerminalConfig;
+use crate::config::{SchemeColors, TerminalConfig};
 use crate::core::TerminalCore;
 use crate::core::command::TerminalCommand;
 use crate::core::update::FrameUpdate;
@@ -206,6 +206,14 @@ impl TerminalSession {
             }
         });
         seen
+    }
+
+    /// Draws with the colours of `scheme` from now on, the other colours as they are.
+    ///
+    /// For a session no view draws: a view sends the colours its style sheet names. A program
+    /// that asked to hear of colour scheme changes is told when the text or background changes.
+    pub fn set_scheme(&self, scheme: SchemeColors) {
+        self.send(TerminalCommand::SetScheme(Box::new(scheme)));
     }
 
     /// Says nobody is drawing it any more. The program carries on.

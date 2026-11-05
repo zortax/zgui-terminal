@@ -504,3 +504,29 @@ fn a_synchronized_update_the_program_never_ends_is_drawn_once_it_expires() {
     harness.program_writes(b"old\x1b[?2026h\r\x1b[2Kthinking");
     harness.wait_for_text("thinking");
 }
+
+#[test]
+fn a_new_colour_scheme_for_a_session_nobody_draws_is_reported() {
+    let harness = Harness::new(20, 5);
+    harness.core.set_colors(styled());
+    harness.program_writes_and_waits(b"\x1b[?2031h");
+    let light = light().colors;
+    harness.core.set_scheme(zgui_terminal::SchemeColors {
+        foreground: light.foreground,
+        background: light.background,
+        cursor: light.cursor,
+        ansi: light.ansi,
+    });
+    assert_eq!(harness.terminal_wrote(), b"\x1b[?997;2n");
+    harness.program_writes(b"\x1b]11;?\x07\x1b]12;?\x07");
+    assert_eq!(harness.terminal_wrote(), b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+    let cursor = harness.terminal_wrote();
+    assert_eq!(
+        cursor,
+        format!(
+            "\x1b]12;rgb:{0:02x}{0:02x}/{1:02x}{1:02x}/{2:02x}{2:02x}\x07",
+            light.cursor.r, light.cursor.g, light.cursor.b
+        )
+        .into_bytes()
+    );
+}

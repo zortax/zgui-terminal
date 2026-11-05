@@ -598,6 +598,13 @@ impl Pump {
                 // Every row was built with the old colours in it.
                 self.restart_rows();
             }
+            TerminalCommand::SetScheme(scheme) => {
+                let before = self.config.colors;
+                self.config.colors = before.with_scheme(*scheme);
+                self.builder.set_palette(self.config.colors);
+                self.scheme_changed(before);
+                self.restart_rows();
+            }
             TerminalCommand::SetConfig(config) => {
                 let config = *config;
                 let before = self.config.colors;
