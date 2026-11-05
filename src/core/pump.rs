@@ -15,7 +15,7 @@ use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::search::RegexSearch;
 use alacritty_terminal::term::{TermDamage, TermMode};
-use alacritty_terminal::vte::ansi::{Handler, Processor};
+use alacritty_terminal::vte::ansi::{Handler, Processor, Timeout};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
@@ -270,14 +270,23 @@ impl Pump {
     /// quick. Everything that arrives inside the window after it joins the same frame, which is
     /// what keeps a flood from asking for a frame per read.
     ///
-    /// A size waiting to rest bounds the wait, and applies when nothing newer came before it.
+    /// A size waiting to rest bounds the wait, and applies when nothing newer came before it. A
+    /// synchronized update the program did not end bounds it too, and applies when it expires.
     pub fn run(mut self) {
         loop {
-            let first = match self.pending_size {
-                Some((_, due)) => match self.inbox.recv_deadline(due) {
+            let size_due = self.pending_size.map(|(_, due)| due);
+            let wake = match (size_due, self.sync_deadline()) {
+                (Some(size), Some(sync)) => Some(size.min(sync)),
+                (size, sync) => size.or(sync),
+            };
+            let first = match wake {
+                Some(due) => match self.inbox.recv_deadline(due) {
                     Ok(message) => message,
                     Err(flume::RecvTimeoutError::Timeout) => {
-                        self.apply_pending_size();
+                        self.end_expired_sync();
+                        if size_due.is_some_and(|due| due <= Instant::now()) {
+                            self.apply_pending_size();
+                        }
                         self.publish();
                         continue;
                     }
@@ -312,7 +321,24 @@ impl Pump {
             {
                 self.apply_pending_size();
             }
+            self.end_expired_sync();
             self.publish();
+        }
+    }
+
+    /// When the synchronized update the program started expires.
+    fn sync_deadline(&self) -> Option<Instant> {
+        self.processor.sync_timeout().sync_timeout()
+    }
+
+    /// Applies a synchronized update whose time ran out, as though the program had ended it.
+    fn end_expired_sync(&mut self) {
+        if self
+            .sync_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            self.processor.stop_sync(&mut *self.term.lock());
+            self.dirty = true;
         }
     }
 
@@ -320,6 +346,7 @@ impl Pump {
     fn apply(&mut self, message: PumpMessage) -> bool {
         match message {
             PumpMessage::Bytes(bytes) => {
+                self.end_expired_sync();
                 let term = &self.term;
                 let processor = &mut self.processor;
                 let prompt = &mut self.prompt;
@@ -331,7 +358,15 @@ impl Pump {
                     Piece::Mark(mark) => prompt.mark(mark, &locked),
                     Piece::Control(Control::SchemeReports(on)) => scheme_reports = on,
                     Piece::Control(Control::SchemeQuery) => scheme_asked = true,
-                    Piece::Control(Control::FullReset) => scheme_reports = false,
+                    Piece::Control(Control::FullReset) => {
+                        // A reset ends every mode, a synchronized update too. The update held
+                        // the reset back, so it applies now, with everything before it.
+                        if processor.sync_timeout().pending_timeout() {
+                            processor.stop_sync(&mut *locked);
+                        }
+                        prompt.forget();
+                        scheme_reports = false;
+                    }
                 });
                 drop(locked);
                 self.scheme_reports = scheme_reports;
@@ -1192,5 +1227,94 @@ fn clipboard_kind(kind: alacritty_terminal::term::ClipboardType) -> zgui::prelud
             zgui::prelude::ClipboardKind::Standard
         }
         alacritty_terminal::term::ClipboardType::Selection => zgui::prelude::ClipboardKind::Primary,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pump over a 20 by 4 grid, driven by hand.
+    fn pump() -> Pump {
+        let (inbox_sender, inbox) = flume::unbounded();
+        let (writer, _) = flume::unbounded();
+        let (updates, _) = flume::unbounded();
+        let size = TerminalSize {
+            columns: 20,
+            lines: 4,
+            cell_width: 9,
+            cell_height: 19,
+        };
+        let proxy = EventProxy::new(inbox_sender.clone());
+        let (pump, _) = Pump::new(
+            TerminalConfig::default(),
+            size,
+            proxy,
+            writer,
+            updates,
+            inbox,
+            inbox_sender,
+        );
+        pump
+    }
+
+    /// The text of every screen line, joined by newlines.
+    fn screen(pump: &Pump) -> String {
+        let term = pump.term.lock();
+        (0..term.screen_lines())
+            .map(|line| {
+                let row = &term.grid()[Line(line as i32)];
+                (0..term.columns())
+                    .map(|column| row[Column(column)].c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn feed(pump: &mut Pump, bytes: &[u8]) {
+        assert!(pump.apply(PumpMessage::Bytes(bytes.to_vec())));
+    }
+
+    #[test]
+    fn a_reset_ends_a_synchronized_update_the_program_left_open() {
+        let mut pump = pump();
+        feed(&mut pump, b"old\x1b[?2026h\r\x1b[2Kthinking");
+        assert_eq!(screen(&pump).lines().next(), Some("old"));
+        feed(&mut pump, b"\x1bc\x1b[3Jfresh");
+        assert_eq!(screen(&pump).lines().next(), Some("fresh"));
+        assert!(pump.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn a_synchronized_update_applies_once_it_expires() {
+        let mut pump = pump();
+        feed(&mut pump, b"old\x1b[?2026h\r\x1b[2Kthinking");
+        assert_eq!(screen(&pump).lines().next(), Some("old"));
+        let deadline = pump.sync_deadline().expect("an update in progress");
+        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        pump.end_expired_sync();
+        assert_eq!(screen(&pump).lines().next(), Some("thinking"));
+        // Output after it is drawn at once.
+        feed(&mut pump, b"\r\nnext");
+        assert_eq!(screen(&pump).lines().nth(1), Some("next"));
+    }
+
+    #[test]
+    fn an_ended_synchronized_update_applies_at_once() {
+        let mut pump = pump();
+        feed(&mut pump, b"\x1b[?2026hframe\x1b[?2026l");
+        assert_eq!(screen(&pump).lines().next(), Some("frame"));
+    }
+
+    #[test]
+    fn a_reset_forgets_where_the_prompt_starts() {
+        let mut pump = pump();
+        feed(&mut pump, b"\x1b]133;A\x07$ ");
+        assert!(pump.prompt.start_on_screen(&*pump.term.lock()).is_some());
+        feed(&mut pump, b"\x1bc");
+        assert!(pump.prompt.start_on_screen(&*pump.term.lock()).is_none());
     }
 }

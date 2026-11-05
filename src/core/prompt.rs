@@ -45,11 +45,16 @@ impl PromptTracker {
         }
     }
 
+    /// Forgets where the prompt starts, as a reset of the terminal does.
+    pub fn forget(&mut self) {
+        self.start = None;
+    }
+
     /// The screen line the prompt starts on, when the cursor is in a prompt on the screen.
     ///
     /// Lines that scroll off the top while the history is full leave the count unchanged, so
     /// the answer is never below the cursor.
-    fn start_on_screen<T>(&self, term: &Term<T>) -> Option<usize> {
+    pub(crate) fn start_on_screen<T>(&self, term: &Term<T>) -> Option<usize> {
         if term.mode().contains(TermMode::ALT_SCREEN) {
             return None;
         }

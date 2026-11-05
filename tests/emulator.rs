@@ -497,3 +497,10 @@ fn a_program_asking_for_the_colour_scheme_gets_an_answer() {
     harness.program_writes(b"\x1b[?996n");
     assert_eq!(harness.terminal_wrote(), b"\x1b[?997;2n");
 }
+
+#[test]
+fn a_synchronized_update_the_program_never_ends_is_drawn_once_it_expires() {
+    let harness = Harness::new(20, 5);
+    harness.program_writes(b"old\x1b[?2026h\r\x1b[2Kthinking");
+    harness.wait_for_text("thinking");
+}
