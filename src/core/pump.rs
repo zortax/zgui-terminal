@@ -85,6 +85,13 @@ const COUNT_LIMIT: usize = 10_000;
 pub(crate) enum PumpMessage {
     /// Output from the program.
     Bytes(Vec<u8>),
+    /// A whole screen, encoded for an empty terminal of `size`.
+    Snapshot {
+        /// The size the bytes were encoded for.
+        size: TerminalSize,
+        /// The bytes that draw the screen.
+        bytes: Vec<u8>,
+    },
     /// Something the emulator reported.
     Term(Event),
     /// Something the view asked for.
@@ -99,6 +106,7 @@ impl From<TransportMessage> for PumpMessage {
     fn from(message: TransportMessage) -> Self {
         match message {
             TransportMessage::Bytes(bytes) => Self::Bytes(bytes),
+            TransportMessage::Snapshot { size, bytes } => Self::Snapshot { size, bytes },
             TransportMessage::Exited(status) => Self::Exited(status),
             TransportMessage::Failed(error) => Self::Failed(error),
         }
@@ -347,33 +355,11 @@ impl Pump {
         match message {
             PumpMessage::Bytes(bytes) => {
                 self.end_expired_sync();
-                let term = &self.term;
-                let processor = &mut self.processor;
-                let prompt = &mut self.prompt;
-                let mut scheme_reports = self.scheme_reports;
-                let mut scheme_asked = false;
-                let mut locked = term.lock();
-                self.prefilter.filter(&bytes, &mut |piece| match piece {
-                    Piece::Bytes(chunk) => processor.advance(&mut *locked, chunk),
-                    Piece::Mark(mark) => prompt.mark(mark, &locked),
-                    Piece::Control(Control::SchemeReports(on)) => scheme_reports = on,
-                    Piece::Control(Control::SchemeQuery) => scheme_asked = true,
-                    Piece::Control(Control::FullReset) => {
-                        // A reset ends every mode, a synchronized update too. The update held
-                        // the reset back, so it applies now, with everything before it.
-                        if processor.sync_timeout().pending_timeout() {
-                            processor.stop_sync(&mut *locked);
-                        }
-                        prompt.forget();
-                        scheme_reports = false;
-                    }
-                });
-                drop(locked);
-                self.scheme_reports = scheme_reports;
-                if scheme_asked {
-                    self.report_scheme();
-                }
-                self.dirty = true;
+                self.parse(&bytes);
+                true
+            }
+            PumpMessage::Snapshot { size, bytes } => {
+                self.take_snapshot(size, &bytes);
                 true
             }
             PumpMessage::Term(event) => self.on_term_event(event),
@@ -387,6 +373,88 @@ impl Pump {
                 false
             }
         }
+    }
+
+    /// Parses output from the program.
+    fn parse(&mut self, bytes: &[u8]) {
+        let term = Arc::clone(&self.term);
+        self.parse_into(&mut term.lock(), bytes);
+    }
+
+    /// Parses output from the program into `term`, which the caller holds locked.
+    fn parse_into(&mut self, term: &mut Term<EventProxy>, bytes: &[u8]) {
+        let processor = &mut self.processor;
+        let prompt = &mut self.prompt;
+        let mut scheme_reports = self.scheme_reports;
+        let mut scheme_asked = false;
+        self.prefilter.filter(bytes, &mut |piece| match piece {
+            Piece::Bytes(chunk) => processor.advance(&mut *term, chunk),
+            Piece::Mark(mark) => prompt.mark(mark, term),
+            Piece::Control(Control::SchemeReports(on)) => scheme_reports = on,
+            Piece::Control(Control::SchemeQuery) => scheme_asked = true,
+            Piece::Control(Control::FullReset) => {
+                // A reset ends every mode, a synchronized update too. The update held
+                // the reset back, so it applies now, with everything before it.
+                if processor.sync_timeout().pending_timeout() {
+                    processor.stop_sync(&mut *term);
+                }
+                prompt.forget();
+                scheme_reports = false;
+            }
+        });
+        self.scheme_reports = scheme_reports;
+        if scheme_asked {
+            self.report_scheme();
+        }
+        self.dirty = true;
+    }
+
+    /// Replaces everything the emulator holds with a whole screen.
+    ///
+    /// The emulator starts over from an empty state: no history, no modes, no half read
+    /// sequence and no synchronized update. It takes `size`, which is what the bytes place their
+    /// rows and cursor for, parses them, and then returns to the size of the grid. That last step
+    /// reflows the screen as a resize does, the prompt kept out of it. The emulator stays locked
+    /// through all of it, and the batch publishes only the result.
+    ///
+    /// Once the grid took a size from the view, the transport hears that size again when `size`
+    /// differs from it, so the program behind it takes the grid's size and draws for it.
+    fn take_snapshot(&mut self, size: TerminalSize, bytes: &[u8]) {
+        self.processor = Processor::new();
+        self.prefilter = Prefilter::new();
+        self.prompt.forget();
+        self.scheme_reports = false;
+        let grid = TermSize::new(usize::from(self.size.columns), usize::from(self.size.lines));
+        let encoded = TermSize::new(usize::from(size.columns), usize::from(size.lines));
+        let differs = grid.columns != encoded.columns || grid.screen_lines != encoded.screen_lines;
+        let term = Arc::clone(&self.term);
+        let mut locked = term.lock();
+        locked.reset_state();
+        locked.resize(encoded);
+        self.parse_into(&mut locked, bytes);
+        if differs {
+            self.prompt.resize(&mut *locked, grid);
+        }
+        drop(locked);
+        if differs && self.sized {
+            let _ = self.writer.send(WriteRequest::Resize(self.size));
+        }
+        self.restart_search();
+        self.restart_rows();
+    }
+
+    /// Counts the matches of the search in progress again, after the grid changed under it.
+    fn restart_search(&mut self) {
+        let Some(search) = self.search.as_mut() else {
+            return;
+        };
+        search.focus = None;
+        search.counted_to = None;
+        search.total = 0;
+        search.complete = false;
+        self.search_state.current = None;
+        self.search_state.wrapped = false;
+        self.count_search();
     }
 
     /// Answers one of the emulator's own events.
@@ -1243,26 +1311,80 @@ mod tests {
 
     /// A pump over a 20 by 4 grid, driven by hand.
     fn pump() -> Pump {
-        let (inbox_sender, inbox) = flume::unbounded();
-        let (writer, _) = flume::unbounded();
-        let (updates, _) = flume::unbounded();
-        let size = TerminalSize {
-            columns: 20,
-            lines: 4,
+        sized(20, 4).0
+    }
+
+    /// A grid size of `columns` by `lines`.
+    fn size(columns: u16, lines: u16) -> TerminalSize {
+        TerminalSize {
+            columns,
+            lines,
             cell_width: 9,
             cell_height: 19,
-        };
+        }
+    }
+
+    /// A pump over a `columns` by `lines` grid that took its size, and what it writes to the
+    /// program.
+    fn sized(columns: u16, lines: u16) -> (Pump, flume::Receiver<WriteRequest>) {
+        let (pump, written, _) = watched(columns, lines);
+        (pump, written)
+    }
+
+    /// A pump over a `columns` by `lines` grid that took its size, what it writes to the
+    /// program, and what it publishes.
+    fn watched(
+        columns: u16,
+        lines: u16,
+    ) -> (
+        Pump,
+        flume::Receiver<WriteRequest>,
+        flume::Receiver<FrameUpdate>,
+    ) {
+        let (inbox_sender, inbox) = flume::unbounded();
+        let (writer, written) = flume::unbounded();
+        let (updates, published) = flume::unbounded();
         let proxy = EventProxy::new(inbox_sender.clone());
-        let (pump, _) = Pump::new(
+        let (mut pump, _) = Pump::new(
             TerminalConfig::default(),
-            size,
+            size(columns, lines),
             proxy,
             writer,
             updates,
             inbox,
             inbox_sender,
         );
-        pump
+        pump.sized = true;
+        (pump, written, published)
+    }
+
+    /// Where the cursor is on the screen, as row and column.
+    fn cursor(pump: &Pump) -> (i32, usize) {
+        let point = pump.term.lock().grid().cursor.point;
+        (point.line.0, point.column.0)
+    }
+
+    /// The text of every line the history holds, oldest first.
+    fn history(pump: &Pump) -> Vec<String> {
+        let contents = crate::grid::read(&pump.term.lock());
+        contents.lines[..contents.screen].to_vec()
+    }
+
+    /// A snapshot of a shell at 20 by 3: two lines in the history, two of output on the
+    /// screen, and a marked prompt with the cursor after it on the last row.
+    const SHELL: &[u8] = b"\x1b[?2026l\x1bc\
+        one\r\ntwo\r\nthree\r\nfour\r\n\
+        \x1b[3;1H\x1b]133;A\x07$ \x1b[3;3H";
+
+    /// The sizes the pump told the program about.
+    fn resizes(written: &flume::Receiver<WriteRequest>) -> Vec<TerminalSize> {
+        written
+            .try_iter()
+            .filter_map(|request| match request {
+                WriteRequest::Resize(size) => Some(size),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The text of every screen line, joined by newlines.
@@ -1323,5 +1445,183 @@ mod tests {
         assert!(pump.prompt.start_on_screen(&*pump.term.lock()).is_some());
         feed(&mut pump, b"\x1bc");
         assert!(pump.prompt.start_on_screen(&*pump.term.lock()).is_none());
+    }
+
+    #[test]
+    fn a_snapshot_lands_as_it_would_on_a_grid_of_its_own_size_then_resized() {
+        // What a grid of the snapshot's size shows after a resize to the grid's size.
+        let (mut reference, _) = sized(20, 3);
+        feed(&mut reference, SHELL);
+        reference.resize(size(20, 6));
+
+        let (mut pump, written) = sized(20, 6);
+        feed(
+            &mut pump,
+            b"stale 1\r\nstale 2\r\nstale 3\r\nstale 4\r\nstale 5\r\nstale 6",
+        );
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(20, 3),
+            bytes: SHELL.to_vec(),
+        }));
+
+        assert_eq!(screen(&pump), screen(&reference));
+        assert_eq!(history(&pump), history(&reference));
+        assert_eq!(cursor(&pump), cursor(&reference));
+        let (row, column) = cursor(&pump);
+        let rows: Vec<String> = screen(&pump).lines().map(str::to_owned).collect();
+        assert_eq!(rows[row as usize], "$", "{rows:?}");
+        assert_eq!(column, 2);
+        assert!(
+            rows[row as usize + 1..].iter().all(String::is_empty),
+            "nothing stale below the prompt: {rows:?}"
+        );
+        assert!(!screen(&pump).contains("stale"));
+        assert_eq!(
+            pump.prompt.start_on_screen(&*pump.term.lock()),
+            Some(row as usize)
+        );
+        // The program hears the grid's size, so it draws for the grid.
+        assert_eq!(resizes(&written), vec![size(20, 6)]);
+    }
+
+    #[test]
+    fn a_snapshot_parsed_at_the_grid_size_alone_puts_the_prompt_too_high() {
+        // The bytes place the cursor by absolute rows: on a taller grid the history comes back
+        // onto the screen, and the cursor lands on the output above the prompt.
+        let (mut pump, _) = sized(20, 6);
+        feed(&mut pump, SHELL);
+        let (row, _) = cursor(&pump);
+        let rows: Vec<String> = screen(&pump).lines().map(str::to_owned).collect();
+        assert_ne!(rows[row as usize], "$", "{rows:?}");
+    }
+
+    #[test]
+    fn a_narrower_snapshot_reflows_into_a_wider_grid() {
+        let bytes = b"\x1bc0123456789abcdefghij\r\nnext\x1b[3;5H";
+        let (mut reference, _) = sized(10, 4);
+        feed(&mut reference, bytes);
+        reference.resize(size(30, 4));
+
+        let (mut pump, _) = sized(30, 4);
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(10, 4),
+            bytes: bytes.to_vec(),
+        }));
+        assert_eq!(screen(&pump), screen(&reference));
+        assert_eq!(cursor(&pump), cursor(&reference));
+        assert_eq!(screen(&pump).lines().next(), Some("0123456789abcdefghij"));
+    }
+
+    #[test]
+    fn a_snapshot_empties_the_history_and_the_modes() {
+        let (mut pump, _) = sized(20, 4);
+        let old: Vec<u8> = (0..30)
+            .flat_map(|n| format!("old {n}\r\n").into_bytes())
+            .chain(b"\x1b[?2004h\x1b[?1000h".iter().copied())
+            .collect();
+        feed(&mut pump, &old);
+        assert!(!history(&pump).is_empty());
+        assert!(pump.term.lock().mode().contains(TermMode::BRACKETED_PASTE));
+
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(20, 4),
+            bytes: b"fresh".to_vec(),
+        }));
+        assert!(history(&pump).is_empty());
+        assert_eq!(screen(&pump), "fresh\n\n\n");
+        let mode = *pump.term.lock().mode();
+        assert!(!mode.contains(TermMode::BRACKETED_PASTE));
+        assert!(!mode.intersects(TermMode::MOUSE_MODE));
+    }
+
+    #[test]
+    fn a_snapshot_of_the_same_size_tells_the_program_nothing() {
+        let (mut pump, written) = sized(20, 4);
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(20, 4),
+            bytes: b"\x1bcsame".to_vec(),
+        }));
+        assert_eq!(screen(&pump).lines().next(), Some("same"));
+        assert!(resizes(&written).is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_of_the_alternate_screen_lands_on_it() {
+        let bytes = b"\x1bcshell\x1b[?1049h\x1b[H\x1b[2Jtop\x1b[3;1Hbottom row";
+        let (mut reference, _) = sized(12, 3);
+        feed(&mut reference, bytes);
+        reference.resize(size(24, 5));
+
+        let (mut pump, _) = sized(24, 5);
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(12, 3),
+            bytes: bytes.to_vec(),
+        }));
+        assert!(pump.term.lock().mode().contains(TermMode::ALT_SCREEN));
+        assert_eq!(screen(&pump), screen(&reference));
+        assert_eq!(cursor(&pump), cursor(&reference));
+        assert_eq!(screen(&pump).lines().nth(2), Some("bottom row"));
+        // Leaving the alternate screen shows the shell the snapshot drew under it.
+        feed(&mut pump, b"\x1b[?1049l");
+        assert_eq!(screen(&pump).lines().next(), Some("shell"));
+    }
+
+    #[test]
+    fn a_snapshot_ends_a_synchronized_update_and_a_cut_sequence() {
+        let (mut pump, _) = sized(20, 4);
+        // The stream stops inside a frame, and inside a sequence of it.
+        feed(&mut pump, b"old\x1b[?2026h\r\x1b[2Kthinking\x1b[3");
+        assert!(pump.sync_deadline().is_some());
+
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(10, 2),
+            bytes: b"\x1bcfresh".to_vec(),
+        }));
+        assert!(pump.sync_deadline().is_none());
+        assert_eq!(screen(&pump).lines().next(), Some("fresh"));
+        // Output after the snapshot is drawn at once, and parsed from a clean state.
+        feed(&mut pump, b"!");
+        assert_eq!(screen(&pump).lines().next(), Some("fresh!"));
+    }
+
+    #[test]
+    fn a_snapshot_publishes_one_frame_at_the_grid_size() {
+        let (mut pump, _, published) = watched(20, 6);
+        pump.publish();
+        published.try_iter().for_each(drop);
+
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(20, 3),
+            bytes: SHELL.to_vec(),
+        }));
+        pump.publish();
+        let frames: Vec<GridDimensions> = published
+            .try_iter()
+            .filter_map(|update| match update {
+                FrameUpdate::Rows {
+                    dimensions,
+                    rebuild,
+                    ..
+                } => {
+                    assert!(rebuild, "every row is published again");
+                    Some(dimensions)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!((frames[0].columns, frames[0].screen_lines), (20, 6));
+    }
+
+    #[test]
+    fn a_snapshot_before_the_view_measured_tells_the_program_nothing() {
+        let (mut pump, written) = sized(20, 6);
+        pump.sized = false;
+        assert!(pump.apply(PumpMessage::Snapshot {
+            size: size(20, 3),
+            bytes: SHELL.to_vec(),
+        }));
+        assert_eq!(pump.term.lock().screen_lines(), 6);
+        assert!(resizes(&written).is_empty());
     }
 }

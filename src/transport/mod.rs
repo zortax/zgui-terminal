@@ -13,7 +13,7 @@ mod read_write;
 use std::cell::Cell;
 use std::fmt;
 
-pub use crate::transport::channels::Channels;
+pub use crate::transport::channels::{Channels, Output};
 #[cfg(feature = "pty")]
 pub use crate::transport::pty::Pty;
 pub use crate::transport::read_write::ReadWrite;
@@ -104,6 +104,13 @@ impl From<std::io::Error> for TransportError {
 pub(crate) enum TransportMessage {
     /// One chunk of output.
     Bytes(Vec<u8>),
+    /// A whole screen, encoded for an empty terminal of `size`.
+    Snapshot {
+        /// The size the bytes were encoded for.
+        size: TerminalSize,
+        /// The bytes that draw the screen.
+        bytes: Vec<u8>,
+    },
     /// The program ended.
     Exited(ExitStatus),
     /// The transport failed.
@@ -129,6 +136,24 @@ impl OutputSink {
     /// Hands over one chunk of output.
     pub fn bytes(&self, bytes: Vec<u8>) {
         let _ = self.sender.send(TransportMessage::Bytes(bytes));
+    }
+
+    /// Hands over a whole screen: `bytes` encoded for an empty terminal of `size`.
+    ///
+    /// The emulator empties itself, history and modes included, takes `size`, parses `bytes`
+    /// and then returns to the size of its grid, which reflows the screen as a resize does. No
+    /// frame shows the steps between. When `size` differs from the grid's, the transport hears
+    /// the grid's size again, so the peer takes it.
+    pub fn snapshot(&self, size: TerminalSize, bytes: Vec<u8>) {
+        let _ = self.sender.send(TransportMessage::Snapshot { size, bytes });
+    }
+
+    /// Hands over one item of `output`.
+    pub fn output(&self, output: Output) {
+        match output {
+            Output::Bytes(bytes) => self.bytes(bytes),
+            Output::Snapshot { size, bytes } => self.snapshot(size, bytes),
+        }
     }
 
     /// Reports that the program ended.

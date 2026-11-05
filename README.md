@@ -24,7 +24,9 @@ fn Shell() -> impl IntoView {
 - **Any source of bytes.** [`Transport`] is one small trait. `Pty` runs a program on this
   machine, `Channels` reaches a peer that speaks in channels, and `ReadWrite` wraps a pair of
   byte streams. A transport with a runtime of its own implements the trait in about fifteen
-  lines, and no runtime type appears in the contract.
+  lines, and no runtime type appears in the contract. A peer that sends whole screens encoded
+  for a size of its own hands them over as snapshots, and the grid parses each one at that size
+  before it reflows to its own.
 - **Pixel-perfect box drawing.** Box drawing, block elements, powerline separators and the
   rounded caps beside them are built for the cell the grid measured rather than taken from the
   font, so they join with no seam at any size or scale.
