@@ -5,9 +5,10 @@
 //! bytes first.
 //!
 //! The filter finds the semantic prompt marks of operating system command 133, which a shell
-//! with shell integration writes around its prompt. Every byte still reaches the parser, which
-//! ignores the sequence. The mark is reported after the bytes of its sequence, so the emulator
-//! state at that moment is the state at the mark.
+//! with shell integration writes around its prompt. It also finds the controls the parser does
+//! not know: the colour scheme reports of private mode 2031, the query for them, and a full
+//! reset, which ends them. Every byte still reaches the parser. A mark or a control is reported
+//! after the bytes of its sequence, so the emulator state at that moment is the state at it.
 
 /// What the filter hands on: bytes for the parser, or a mark it found between them.
 #[derive(Debug, PartialEq, Eq)]
@@ -16,6 +17,26 @@ pub enum Piece<'a> {
     Bytes(&'a [u8]),
     /// A semantic prompt mark, which follows the bytes before it.
     Mark(PromptMark),
+    /// A control the parser does not handle, which follows the bytes before it.
+    Control(Control),
+}
+
+/// A control sequence the emulator answers outside the parser.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Control {
+    /// The program turned the colour scheme reports on (`CSI ? 2031 h`) or off (`CSI ? 2031 l`).
+    SchemeReports(bool),
+    /// The program asked for the colour scheme (`CSI ? 996 n`).
+    SchemeQuery,
+    /// The program reset the terminal (`ESC c`).
+    FullReset,
+}
+
+/// What a sequence that ends at a byte was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Found {
+    Mark(PromptMark),
+    Control(Control),
 }
 
 /// One semantic prompt mark.
@@ -38,6 +59,9 @@ pub enum PromptMark {
 /// command, and the filter stops reading it.
 const BODY_LIMIT: usize = 64;
 
+/// The longest control sequence the filter reads, without its introducer and final byte.
+const CONTROL_LIMIT: usize = 32;
+
 /// Where the filter is in the stream.
 #[derive(Debug, Default)]
 enum State {
@@ -50,6 +74,8 @@ enum State {
     Command,
     /// Inside a command body, after an escape that can start its terminator.
     CommandEscape,
+    /// Inside a control sequence, with its parameters read so far.
+    Control,
 }
 
 /// Watches the byte stream on its way to the parser.
@@ -76,9 +102,12 @@ impl Prefilter {
         }
         let mut from = 0;
         for (index, byte) in bytes.iter().copied().enumerate() {
-            if let Some(mark) = self.step(byte) {
+            if let Some(found) = self.step(byte) {
                 forward(Piece::Bytes(&bytes[from..=index]));
-                forward(Piece::Mark(mark));
+                forward(match found {
+                    Found::Mark(mark) => Piece::Mark(mark),
+                    Found::Control(control) => Piece::Control(control),
+                });
                 from = index + 1;
             }
         }
@@ -87,10 +116,12 @@ impl Prefilter {
         }
     }
 
-    /// Reads one byte. Answers the mark a command ending at this byte made.
-    fn step(&mut self, byte: u8) -> Option<PromptMark> {
+    /// Reads one byte. Answers what a sequence ending at this byte was.
+    fn step(&mut self, byte: u8) -> Option<Found> {
         const ESCAPE: u8 = 0x1b;
         const BELL: u8 = 0x07;
+        const CANCEL: u8 = 0x18;
+        const SUBSTITUTE: u8 = 0x1a;
         match self.state {
             State::Ground => {
                 if byte == ESCAPE {
@@ -104,11 +135,46 @@ impl Prefilter {
                         self.body.clear();
                         State::Command
                     }
+                    b'[' => {
+                        self.body.clear();
+                        State::Control
+                    }
                     ESCAPE => State::Escape,
+                    b'c' => {
+                        self.state = State::Ground;
+                        return Some(Found::Control(Control::FullReset));
+                    }
                     _ => State::Ground,
                 };
                 None
             }
+            State::Control => match byte {
+                // Parameter and intermediate bytes.
+                0x20..=0x3f => {
+                    self.body.push(byte);
+                    if self.body.len() > CONTROL_LIMIT {
+                        self.state = State::Ground;
+                    }
+                    None
+                }
+                // The final byte.
+                0x40..=0x7e => {
+                    self.state = State::Ground;
+                    let control = control(&self.body, byte);
+                    self.body.clear();
+                    control.map(Found::Control)
+                }
+                ESCAPE => {
+                    self.state = State::Escape;
+                    None
+                }
+                CANCEL | SUBSTITUTE => {
+                    self.state = State::Ground;
+                    None
+                }
+                // Other control characters act inside a sequence without ending it.
+                _ => None,
+            },
             State::Command => match byte {
                 BELL => self.finish(),
                 ESCAPE => {
@@ -141,11 +207,24 @@ impl Prefilter {
     }
 
     /// Ends the command being read, and answers the mark it was.
-    fn finish(&mut self) -> Option<PromptMark> {
+    fn finish(&mut self) -> Option<Found> {
         self.state = State::Ground;
         let mark = parse(&self.body);
         self.body.clear();
-        mark
+        mark.map(Found::Mark)
+    }
+}
+
+/// The control a control sequence with `parameters` and `last` is, when the filter answers it.
+fn control(parameters: &[u8], last: u8) -> Option<Control> {
+    let private = parameters.strip_prefix(b"?")?;
+    match last {
+        b'h' | b'l' => private
+            .split(|byte| *byte == b';')
+            .any(|mode| mode == b"2031")
+            .then_some(Control::SchemeReports(last == b'h')),
+        b'n' if private == b"996" => Some(Control::SchemeQuery),
+        _ => None,
     }
 }
 
@@ -173,16 +252,34 @@ mod tests {
     /// What a stream cut into `chunks` comes out as: the bytes, and each mark with how many
     /// bytes came before it.
     fn read(chunks: &[&[u8]]) -> (Vec<u8>, Vec<(usize, PromptMark)>) {
+        let (out, marks, _) = read_all(chunks);
+        (out, marks)
+    }
+
+    /// Bytes, marks and controls, each piece with how many bytes came before it.
+    type Read = (Vec<u8>, Vec<(usize, PromptMark)>, Vec<(usize, Control)>);
+
+    /// What a stream cut into `chunks` comes out as, controls included.
+    fn read_all(chunks: &[&[u8]]) -> Read {
         let mut filter = Prefilter::new();
         let mut out = Vec::new();
         let mut marks = Vec::new();
+        let mut controls = Vec::new();
         for chunk in chunks {
             filter.filter(chunk, &mut |piece| match piece {
                 Piece::Bytes(bytes) => out.extend_from_slice(bytes),
                 Piece::Mark(mark) => marks.push((out.len(), mark)),
+                Piece::Control(control) => controls.push((out.len(), control)),
             });
         }
-        (out, marks)
+        (out, marks, controls)
+    }
+
+    /// The controls a stream holds, in order.
+    fn controls(chunks: &[&[u8]]) -> Vec<Control> {
+        let (out, _, controls) = read_all(chunks);
+        assert_eq!(out, chunks.concat());
+        controls.into_iter().map(|(_, control)| control).collect()
     }
 
     /// Everything that goes in comes out, whatever the chunks look like.
@@ -280,6 +377,71 @@ mod tests {
         long.extend_from_slice(b"\x07\x1b]133;A\x07");
         let (bytes, marks) = read(&[&long]);
         assert_eq!(bytes, long);
+        assert_eq!(marks.len(), 1);
+    }
+
+    #[test]
+    fn the_scheme_report_mode_is_found_on_and_off() {
+        assert_eq!(
+            controls(&[b"\x1b[?2031h", b"\x1b[?2031l"]),
+            vec![Control::SchemeReports(true), Control::SchemeReports(false)]
+        );
+    }
+
+    #[test]
+    fn the_scheme_report_mode_is_found_among_other_modes() {
+        assert_eq!(
+            controls(&[b"\x1b[?2004;2031;1004h"]),
+            vec![Control::SchemeReports(true)]
+        );
+    }
+
+    #[test]
+    fn a_control_follows_the_bytes_of_its_sequence() {
+        let stream = b"ab\x1b[?2031hc";
+        let (_, _, controls) = read_all(&[stream]);
+        assert_eq!(controls, vec![(10, Control::SchemeReports(true))]);
+    }
+
+    #[test]
+    fn a_control_split_anywhere_is_still_found_once() {
+        let stream: &[u8] = b"x\x1b[?2031hy\x1b[?996nz\x1bcw";
+        for cut in 0..=stream.len() {
+            let (head, tail) = stream.split_at(cut);
+            assert_eq!(
+                controls(&[head, tail]),
+                vec![
+                    Control::SchemeReports(true),
+                    Control::SchemeQuery,
+                    Control::FullReset
+                ],
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_controls_are_not_reported() {
+        assert!(
+            controls(&[
+                b"\x1b[2031h\x1b[?20310h\x1b[?2031$p\x1b[?997;1n\x1b[6n\x1b[31m\x1b[?2004h"
+            ])
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_cancelled_or_overlong_control_is_dropped() {
+        let mut long = b"\x1b[?".to_vec();
+        long.extend(std::iter::repeat_n(b'1', 100));
+        long.extend_from_slice(b";2031h");
+        assert!(controls(&[b"\x1b[?20\x1831h", &long]).is_empty());
+    }
+
+    #[test]
+    fn a_control_does_not_hide_a_mark_after_it() {
+        let (_, marks, controls) = read_all(&[b"\x1b[?2031h\x1b]133;A\x07"]);
+        assert_eq!(controls.len(), 1);
         assert_eq!(marks.len(), 1);
     }
 }

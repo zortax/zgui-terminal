@@ -19,10 +19,10 @@ use alacritty_terminal::vte::ansi::{Handler, Processor};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
-use crate::config::TerminalConfig;
+use crate::config::{ColorPalette, TerminalConfig};
 use crate::core::command::{ClearMode, ScrollRequest, TerminalCommand, direction_of};
 use crate::core::listener::EventProxy;
-use crate::core::prefilter::{Piece, Prefilter};
+use crate::core::prefilter::{Control, Piece, Prefilter};
 use crate::core::prompt::PromptTracker;
 use crate::core::update::{ClipboardReply, FrameUpdate};
 use crate::core::writer::WriteRequest;
@@ -207,6 +207,8 @@ pub(crate) struct Pump {
     app_flash: Vec<GridSpan>,
     /// Whether the program has ended. The grid stays readable after the end.
     ended: bool,
+    /// Whether the program asked to hear when the colour scheme changes (private mode 2031).
+    scheme_reports: bool,
 }
 
 impl Pump {
@@ -254,6 +256,7 @@ impl Pump {
             app_cursor: None,
             app_flash: Vec::new(),
             ended: false,
+            scheme_reports: false,
         };
         (pump, term)
     }
@@ -320,12 +323,21 @@ impl Pump {
                 let term = &self.term;
                 let processor = &mut self.processor;
                 let prompt = &mut self.prompt;
+                let mut scheme_reports = self.scheme_reports;
+                let mut scheme_asked = false;
                 let mut locked = term.lock();
                 self.prefilter.filter(&bytes, &mut |piece| match piece {
                     Piece::Bytes(chunk) => processor.advance(&mut *locked, chunk),
                     Piece::Mark(mark) => prompt.mark(mark, &locked),
+                    Piece::Control(Control::SchemeReports(on)) => scheme_reports = on,
+                    Piece::Control(Control::SchemeQuery) => scheme_asked = true,
+                    Piece::Control(Control::FullReset) => scheme_reports = false,
                 });
                 drop(locked);
+                self.scheme_reports = scheme_reports;
+                if scheme_asked {
+                    self.report_scheme();
+                }
                 self.dirty = true;
                 true
             }
@@ -540,19 +552,24 @@ impl Pump {
                 term.reset_state();
                 drop(term);
                 let _ = dimensions;
+                self.scheme_reports = false;
                 self.restart_rows();
             }
             TerminalCommand::SetColors(config) => {
+                let before = self.config.colors;
                 self.builder.set_palette(config.colors);
                 self.config.colors = config.colors;
+                self.scheme_changed(before);
                 // Every row was built with the old colours in it.
                 self.restart_rows();
             }
             TerminalCommand::SetConfig(config) => {
                 let config = *config;
+                let before = self.config.colors;
                 self.builder.set_palette(config.colors);
                 self.term.lock().set_options(config.term_config());
                 self.config = config;
+                self.scheme_changed(before);
                 self.restart_rows();
             }
         }
@@ -565,6 +582,28 @@ impl Pump {
             self.ended = true;
             let _ = self.updates.send(FrameUpdate::Exited(status));
         }
+    }
+
+    /// Tells a program that asked for it that the colours changed from `before`.
+    ///
+    /// The new colours are in place first, so a query that follows the report reads them.
+    fn scheme_changed(&self, before: ColorPalette) {
+        let now = self.config.colors;
+        if self.scheme_reports
+            && (now.background != before.background || now.foreground != before.foreground)
+        {
+            self.report_scheme();
+        }
+    }
+
+    /// Tells the program whether the colour scheme is dark or light.
+    fn report_scheme(&self) {
+        let report = if self.config.colors.is_dark() {
+            b"\x1b[?997;1n".as_ref()
+        } else {
+            b"\x1b[?997;2n".as_ref()
+        };
+        self.write(report.to_vec());
     }
 
     /// Sends `bytes` to the program.

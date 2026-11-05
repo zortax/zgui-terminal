@@ -81,6 +81,16 @@ pub struct ColorPalette {
     pub ansi: [Rgba; 16],
 }
 
+impl ColorPalette {
+    /// Whether the text is lighter than the background, by the Rec. 601 luma.
+    pub fn is_dark(&self) -> bool {
+        let luma = |color: Rgba| {
+            299 * u32::from(color.r) + 587 * u32::from(color.g) + 114 * u32::from(color.b)
+        };
+        luma(self.background) < luma(self.foreground)
+    }
+}
+
 impl Default for ColorPalette {
     fn default() -> Self {
         Self {

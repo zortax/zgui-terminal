@@ -180,6 +180,7 @@ mod tests {
             filter.filter(bytes, &mut |piece| match piece {
                 Piece::Bytes(bytes) => parser.advance(term, bytes),
                 Piece::Mark(mark) => prompt.mark(mark, term),
+                Piece::Control(_) => {}
             });
         }
 

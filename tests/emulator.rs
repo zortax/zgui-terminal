@@ -425,3 +425,75 @@ fn sizes_in_quick_succession_reach_the_program_once_they_rest() {
         "the sizes before the last never reach the program"
     );
 }
+
+/// A palette with dark text on a white background.
+fn light() -> TerminalConfig {
+    let mut config = TerminalConfig::default();
+    config.colors.foreground = zgui_terminal::config::Rgba::rgb(0x20, 0x20, 0x20);
+    config.colors.background = zgui_terminal::config::Rgba::rgb(0xff, 0xff, 0xff);
+    config
+}
+
+impl Harness {
+    /// Writes `bytes` as the program, and waits until the terminal has read them.
+    fn program_writes_and_waits(&self, bytes: &[u8]) {
+        let mut bytes = bytes.to_vec();
+        bytes.extend_from_slice(b"\x1b[5n");
+        self.program_writes(&bytes);
+        assert_eq!(self.terminal_wrote(), b"\x1b[0n");
+    }
+
+    /// Asserts that the terminal wrote nothing to the program since the last reply.
+    fn terminal_wrote_nothing(&self) {
+        self.program_writes(b"\x1b[5n");
+        assert_eq!(self.terminal_wrote(), b"\x1b[0n");
+    }
+}
+
+#[test]
+fn a_program_that_asked_hears_when_the_colour_scheme_changes() {
+    let harness = Harness::new(20, 5);
+    harness.program_writes_and_waits(b"\x1b[?2031h");
+    harness.core.set_colors(light());
+    assert_eq!(harness.terminal_wrote(), b"\x1b[?997;2n");
+    // The query that follows the report reads the new colour.
+    harness.program_writes(b"\x1b]11;?\x07");
+    assert_eq!(harness.terminal_wrote(), b"\x1b]11;rgb:ffff/ffff/ffff\x07");
+    harness.core.set_colors(styled());
+    assert_eq!(harness.terminal_wrote(), b"\x1b[?997;1n");
+}
+
+#[test]
+fn the_colour_scheme_is_reported_only_while_the_program_asks() {
+    for before in [
+        b"".as_ref(),
+        b"\x1b[?2031h\x1b[?2031l".as_ref(),
+        b"\x1b[?2031h\x1bc".as_ref(),
+    ] {
+        let harness = Harness::new(20, 5);
+        harness.program_writes_and_waits(before);
+        harness.core.set_colors(light());
+        harness.terminal_wrote_nothing();
+    }
+}
+
+#[test]
+fn colours_that_keep_the_scheme_are_not_reported() {
+    let harness = Harness::new(20, 5);
+    harness.core.set_colors(light());
+    harness.program_writes_and_waits(b"\x1b[?2031h");
+    let mut cursor = light();
+    cursor.colors.cursor = zgui_terminal::config::Rgba::rgb(0xff, 0, 0);
+    harness.core.set_colors(cursor);
+    harness.terminal_wrote_nothing();
+}
+
+#[test]
+fn a_program_asking_for_the_colour_scheme_gets_an_answer() {
+    let harness = Harness::new(20, 5);
+    harness.program_writes(b"\x1b[?996n");
+    assert_eq!(harness.terminal_wrote(), b"\x1b[?997;1n");
+    harness.core.set_colors(light());
+    harness.program_writes(b"\x1b[?996n");
+    assert_eq!(harness.terminal_wrote(), b"\x1b[?997;2n");
+}
