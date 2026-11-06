@@ -512,7 +512,7 @@ pub fn Terminal(
                 return;
             }
             // The application is reading the keyboard itself, so the program reads none of it.
-            if !input.get_untracked().is_live() {
+            if !live(input) {
                 cx.stop_propagation();
                 return;
             }
@@ -560,7 +560,7 @@ pub fn Terminal(
         move |cx: &mut EventCx<'_, events::KeyUp>| {
             // A release is held back with its press. Under the kitty protocol a program is told
             // about both, so letting one through reports a key nobody pressed.
-            if !input.get_untracked().is_live() {
+            if !live(input) {
                 return;
             }
             let mode = session.mode();
@@ -574,7 +574,7 @@ pub fn Terminal(
     let ime_commit = {
         let session = session.clone();
         move |cx: &mut EventCx<'_, events::ImeCommit>| {
-            if !input.get_untracked().is_live() {
+            if !live(input) {
                 return;
             }
             if let zgui::vocab::ImeEvent::Commit(text) = &**cx
@@ -677,7 +677,7 @@ pub fn Terminal(
                 // The pointer belongs to the terminal until it comes up, so a selection dragged
                 // past the edge of the window keeps being reported here.
                 cx.capture_pointer();
-            } else if input.get_untracked().is_live()
+            } else if live(input)
                 && let Some(bytes) = encode_mouse(
                     MouseReport::Press(cx.button.unwrap_or_default()),
                     point.column,
@@ -745,7 +745,7 @@ pub fn Terminal(
             session.send(TerminalCommand::HyperlinkAt(Some(point.grid)));
             // A move is reported once per cell, with the button the program was told is down.
             let cell = (point.column, point.row);
-            if input.get_untracked().is_live()
+            if live(input)
                 && reported_cell.get() != Some(cell)
                 && let Some(bytes) = encode_mouse(
                     MouseReport::Motion(held.get().reported()),
@@ -808,7 +808,7 @@ pub fn Terminal(
                 return;
             }
             let mode = session.mode();
-            if input.get_untracked().is_live()
+            if live(input)
                 && let Some(bytes) = encode_mouse(
                     MouseReport::Release(cx.button.unwrap_or_default()),
                     point.column,
@@ -903,7 +903,7 @@ pub fn Terminal(
             }
             // A program that grabbed the wheel reads none of it while the keyboard is held; the
             // view scrolls instead, which is what a mode reading the history wants.
-            let mode = if input.get_untracked().is_live() {
+            let mode = if live(input) {
                 session.mode()
             } else {
                 alacritty_terminal::term::TermMode::empty()
@@ -1041,6 +1041,12 @@ pub fn Terminal(
             {grid.into_view()}
         }
     })
+}
+
+/// Whether what a person types reaches the program. A caller's signal that its owner already
+/// disposed holds the input: an event can still reach the view after its caller unmounted.
+fn live(input: Signal<Input, LocalStorage>) -> bool {
+    input.try_get_untracked().is_some_and(Input::is_live)
 }
 
 /// Whether the emulator needs `palette` sent again, given what was `applied` last.
